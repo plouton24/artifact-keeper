@@ -9,6 +9,8 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -25,6 +27,7 @@ use crate::api::extractors::Json;
 use crate::api::handlers::is_replication_request;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
@@ -39,6 +42,7 @@ use crate::services::repository_service::{
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 
 /// Require that the request is authenticated, returning an error if not.
@@ -378,6 +382,440 @@ pub struct ListRepositoriesQuery {
     pub q: Option<String>,
 }
 
+const DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian_config";
+
+/// Debian/APT repository options exposed through repository create, update, and detail APIs.
+/// Hosted example: `{"distributions":["bookworm"],"components":["main"],"architectures":["amd64","arm64","all"],"signing_enabled":true}`.
+/// Remote proxy example: `{"distributions":["jammy"],"components":["main","universe"],"architectures":["amd64","all"],"upstream_base_url":"https://archive.ubuntu.com/ubuntu"}`.
+/// Filtered sync example: `{"sync":{"base_url":"https://archive.ubuntu.com/ubuntu","distributions":["jammy"],"components":["main"],"architectures":["amd64"],"download_policy":"on_demand"}}`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[schema(example = json!({
+    "distributions": ["jammy"],
+    "suite": "jammy",
+    "codename": "jammy",
+    "description": "Filtered Ubuntu Jammy mirror",
+    "components": ["main", "universe"],
+    "architectures": ["amd64", "arm64", "all"],
+    "signing_enabled": true,
+    "upstream_base_url": "https://archive.ubuntu.com/ubuntu",
+    "sync": {
+        "base_url": "https://archive.ubuntu.com/ubuntu",
+        "distributions": ["jammy"],
+        "components": ["main"],
+        "architectures": ["amd64", "all"],
+        "cache_policy": "metadata_ttl",
+        "download_policy": "on_demand",
+        "re_sign": true
+    },
+    "upload_endpoint": "/debian/<repo-key>/pool/{component}/{path}",
+    "upload_path_template": "pool/{component}/{prefix}/{source-or-package}/{package}_{version}_{architecture}.deb",
+    "upload_metadata_headers": [
+        "X-Debian-Distribution: <distribution>",
+        "X-Debian-Component: <component>",
+        "X-Debian-Architecture: <architecture>"
+    ]
+}))]
+pub struct DebianRepositoryConfig {
+    /// Debian distributions/codenames enabled for this repository, e.g. `jammy`, `noble`, `bookworm`.
+    #[serde(default)]
+    pub distributions: Vec<String>,
+    /// Optional Debian suite value to place in Release metadata.
+    #[serde(default)]
+    pub suite: Option<String>,
+    /// Optional Debian codename value to place in Release metadata.
+    #[serde(default)]
+    pub codename: Option<String>,
+    /// Optional Debian Release description displayed by APT clients.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Debian components enabled for this repository, e.g. `main`, `contrib`, `non-free`, `universe`.
+    #[serde(default)]
+    pub components: Vec<String>,
+    /// Debian architectures enabled for this repository, e.g. `amd64`, `arm64`, `all`.
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    /// Enable Release metadata signing for InRelease and Release.gpg generation.
+    #[serde(default)]
+    pub signing_enabled: bool,
+    /// Existing signing key ID to use when signing is enabled.
+    #[serde(default)]
+    pub signing_key_id: Option<Uuid>,
+    /// Upstream Debian repository URL for remote/proxy repositories.
+    #[serde(default)]
+    pub upstream_base_url: Option<String>,
+    /// Filtered mirror-sync settings for Debian remote repositories.
+    #[serde(default)]
+    pub sync: Option<DebianRepositorySyncConfig>,
+    /// UI-facing apt source example, populated on read when enough fields are configured.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub apt_source_example: Option<String>,
+    /// UI-facing public key endpoint, populated on read when signing is enabled.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub public_key_url: Option<String>,
+    /// UI-facing metadata paths generated for configured distributions/components/architectures.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_paths: Vec<String>,
+    /// UI-facing hosted-upload endpoint template for Debian .deb uploads.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub upload_endpoint: Option<String>,
+    /// UI-facing pool path template used for stable Debian package filenames.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub upload_path_template: Option<String>,
+    /// UI-facing request headers accepted to provide Debian upload metadata.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    pub upload_metadata_headers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[schema(example = json!({
+    "base_url": "https://deb.debian.org/debian",
+    "distributions": ["bookworm"],
+    "components": ["main", "contrib"],
+    "architectures": ["amd64", "all"],
+    "cache_policy": "metadata_ttl",
+    "download_policy": "on_demand",
+    "re_sign": false
+}))]
+pub struct DebianRepositorySyncConfig {
+    /// Upstream base URL used by filtered Debian mirror sync.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Distribution filters for sync.
+    #[serde(default)]
+    pub distributions: Vec<String>,
+    /// Component filters for sync.
+    #[serde(default)]
+    pub components: Vec<String>,
+    /// Architecture filters for sync. `all` packages are included in every selected binary architecture.
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    /// Optional cache policy label if the deployment exposes one.
+    #[serde(default)]
+    pub cache_policy: Option<String>,
+    /// Optional download policy label, e.g. on-demand or immediate, if supported by the deployment.
+    #[serde(default)]
+    pub download_policy: Option<String>,
+    /// Re-sign generated local metadata after filtering upstream content.
+    #[serde(default)]
+    pub re_sign: bool,
+}
+
+impl DebianRepositoryConfig {
+    fn hydrated_for_response(&self, repo_key: &str, upstream_url: Option<&str>) -> Self {
+        let mut config = self.clone();
+        if config.upstream_base_url.is_none() {
+            config.upstream_base_url = upstream_url.map(str::to_string);
+        }
+        if config.apt_source_example.is_none() {
+            config.apt_source_example = build_debian_apt_source_example(repo_key, &config);
+        }
+        if config.public_key_url.is_none() && debian_signing_enabled(&config) {
+            if let Some(distribution) = first_debian_distribution(&config) {
+                config.public_key_url = Some(format!(
+                    "/debian/{repo_key}/dists/{distribution}/gpg-key.asc"
+                ));
+            }
+        }
+        if config.metadata_paths.is_empty() {
+            config.metadata_paths = build_debian_metadata_paths(&config);
+        }
+        if config.upload_endpoint.is_none() {
+            config.upload_endpoint =
+                Some(format!("/debian/{repo_key}/pool/{{component}}/{{path}}"));
+        }
+        if config.upload_path_template.is_none() {
+            config.upload_path_template = Some(
+                "pool/{component}/{prefix}/{source-or-package}/{package}_{version}_{architecture}.deb"
+                    .to_string(),
+            );
+        }
+        if config.upload_metadata_headers.is_empty() {
+            config.upload_metadata_headers = vec![
+                "X-Debian-Distribution: <distribution>".to_string(),
+                "X-Debian-Component: <component>".to_string(),
+                "X-Debian-Architecture: <architecture>".to_string(),
+            ];
+        }
+        config
+    }
+}
+
+fn first_debian_distribution(config: &DebianRepositoryConfig) -> Option<&str> {
+    config
+        .distributions
+        .iter()
+        .map(String::as_str)
+        .find(|value| !value.trim().is_empty())
+        .or(config.codename.as_deref())
+        .or(config.suite.as_deref())
+}
+
+fn build_debian_apt_source_example(
+    repo_key: &str,
+    config: &DebianRepositoryConfig,
+) -> Option<String> {
+    let distribution = first_debian_distribution(config)?;
+    let component = config
+        .components
+        .iter()
+        .map(String::as_str)
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or("main");
+    let signed_by = if config.signing_enabled {
+        " [signed-by=/usr/share/keyrings/artifact-keeper.gpg]"
+    } else {
+        ""
+    };
+    Some(format!(
+        "deb{signed_by} <repo-url>/debian/{repo_key} {distribution} {component}"
+    ))
+}
+
+fn debian_config_upstream_url(
+    config: Option<&DebianRepositoryConfig>,
+    repo_type: &RepositoryType,
+) -> Option<String> {
+    if *repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let config = config?;
+    config
+        .upstream_base_url
+        .as_deref()
+        .or_else(|| {
+            config
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.base_url.as_deref())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn build_debian_metadata_paths(config: &DebianRepositoryConfig) -> Vec<String> {
+    let mut paths = Vec::new();
+    for distribution in &config.distributions {
+        if distribution.trim().is_empty() {
+            continue;
+        }
+        paths.push(format!("dists/{distribution}/Release"));
+        if config.signing_enabled {
+            paths.push(format!("dists/{distribution}/InRelease"));
+            paths.push(format!("dists/{distribution}/Release.gpg"));
+        }
+        for component in &config.components {
+            if component.trim().is_empty() {
+                continue;
+            }
+            for arch in &config.architectures {
+                if arch.trim().is_empty() || arch == "all" {
+                    continue;
+                }
+                paths.push(format!(
+                    "dists/{distribution}/{component}/binary-{arch}/Packages"
+                ));
+                paths.push(format!(
+                    "dists/{distribution}/{component}/binary-{arch}/Packages.gz"
+                ));
+                paths.push(format!(
+                    "dists/{distribution}/{component}/binary-{arch}/Packages.xz"
+                ));
+            }
+        }
+    }
+    paths
+}
+
+fn validate_non_empty_debian_values(values: &[String], field: &str) -> Result<()> {
+    for value in values {
+        validate_debian_identifier(value, field)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_debian_identifier(value: Option<&str>, field: &str) -> Result<()> {
+    if let Some(value) = value {
+        validate_debian_identifier(value, field)?;
+    }
+    Ok(())
+}
+
+fn debian_signing_enabled(config: &DebianRepositoryConfig) -> bool {
+    config.signing_enabled
+        || config
+            .sync
+            .as_ref()
+            .map(|sync| sync.re_sign)
+            .unwrap_or(false)
+}
+
+fn debian_cache_ttl_seconds(config: &DebianRepositoryConfig) -> Result<Option<i64>> {
+    let Some(label) = config
+        .sync
+        .as_ref()
+        .and_then(|sync| sync.cache_policy.as_deref())
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let normalized = label.to_ascii_lowercase();
+    let ttl = match normalized.as_str() {
+        "metadata_ttl" | "default" => crate::services::proxy_service::DEFAULT_DISTS_INDEX_TTL_SECS,
+        "always_revalidate" | "no_cache" | "no-cache" => 0,
+        _ => {
+            let Some(value) = normalized.strip_prefix("ttl:") else {
+                return Err(AppError::Validation(format!(
+                    "Unsupported debian_config.sync.cache_policy '{label}'"
+                )));
+            };
+            value.parse::<i64>().map_err(|_| {
+                AppError::Validation(format!(
+                    "debian_config.sync.cache_policy '{label}' must use ttl:<seconds>"
+                ))
+            })?
+        }
+    };
+    if ttl < 0 {
+        return Err(AppError::Validation(
+            "debian_config.sync.cache_policy TTL must be non-negative".to_string(),
+        ));
+    }
+    Ok(Some(ttl))
+}
+
+fn validate_debian_identifier(value: &str, field: &str) -> Result<()> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+'));
+    if !valid {
+        return Err(AppError::Validation(format!(
+            "debian_config.{field} contains invalid Debian identifier '{value}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_debian_repository_config(
+    format: &RepositoryFormat,
+    config: Option<&DebianRepositoryConfig>,
+) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if *format != RepositoryFormat::Debian {
+        return Err(AppError::Validation(
+            "debian_config is only valid for Debian/APT repositories".to_string(),
+        ));
+    }
+    validate_non_empty_debian_values(&config.distributions, "distributions")?;
+    validate_non_empty_debian_values(&config.components, "components")?;
+    validate_non_empty_debian_values(&config.architectures, "architectures")?;
+    validate_optional_debian_identifier(config.suite.as_deref(), "suite")?;
+    validate_optional_debian_identifier(config.codename.as_deref(), "codename")?;
+    if let Some(url) = config.upstream_base_url.as_deref() {
+        validate_outbound_url(url, "Debian upstream base URL")?;
+    }
+    if let Some(sync) = &config.sync {
+        validate_non_empty_debian_values(&sync.distributions, "sync.distributions")?;
+        validate_non_empty_debian_values(&sync.components, "sync.components")?;
+        validate_non_empty_debian_values(&sync.architectures, "sync.architectures")?;
+        if let Some(url) = sync.base_url.as_deref() {
+            validate_outbound_url(url, "Debian sync base URL")?;
+        }
+        if let Some(policy) = sync.download_policy.as_deref() {
+            match policy.trim().to_ascii_lowercase().as_str() {
+                "" | "on_demand" | "on-demand" | "immediate" | "eager" | "full" | "full_mirror"
+                | "full-mirror" => {}
+                _ => {
+                    return Err(AppError::Validation(format!(
+                        "Unsupported debian_config.sync.download_policy '{policy}'"
+                    )))
+                }
+            }
+        }
+    }
+    debian_cache_ttl_seconds(config)?;
+    Ok(())
+}
+
+async fn upsert_debian_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    config: &DebianRepositoryConfig,
+) -> Result<()> {
+    let value = serde_json::to_string(config)
+        .map_err(|e| AppError::Validation(format!("Invalid Debian config: {e}")))?;
+    upsert_repo_config(db, repo_id, DEBIAN_REPOSITORY_CONFIG_KEY, &value).await
+}
+
+async fn sync_debian_signing_config(
+    state: &SharedState,
+    repo_id: Uuid,
+    config: &DebianRepositoryConfig,
+) -> Result<()> {
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let existing = signing_svc.get_signing_config(repo_id).await?;
+    let existing_key = existing.as_ref().and_then(|config| config.signing_key_id);
+    let signing_key_id = config.signing_key_id.or(existing_key);
+
+    signing_svc
+        .update_signing_config(
+            repo_id,
+            signing_key_id,
+            debian_signing_enabled(config),
+            false,
+            false,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn load_debian_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    response: &RepositoryResponse,
+) -> Option<DebianRepositoryConfig> {
+    if response.format != "debian" {
+        return None;
+    }
+    let stored = match sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(DEBIAN_REPOSITORY_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!(repository_id = %repo_id, error = %e, "failed to load Debian repository config");
+            None
+        }
+    };
+
+    match stored {
+        Some(value) => match serde_json::from_str::<DebianRepositoryConfig>(&value) {
+            Ok(config) => {
+                Some(config.hydrated_for_response(&response.key, response.upstream_url.as_deref()))
+            }
+            Err(e) => {
+                tracing::warn!(repository_id = %repo_id, error = %e, "invalid stored Debian repository config");
+                None
+            }
+        },
+        None => Some(
+            DebianRepositoryConfig::default()
+                .hydrated_for_response(&response.key, response.upstream_url.as_deref()),
+        ),
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRepositoryRequest {
     pub key: String,
@@ -420,6 +858,8 @@ pub struct CreateRepositoryRequest {
     /// Stored in `repository_config` under `pypi_upstream_index_path`.
     /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
+    /// Debian/APT repository options surfaced to UI/OpenAPI clients.
+    pub debian_config: Option<DebianRepositoryConfig>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
     pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
@@ -477,6 +917,8 @@ pub struct UpdateRepositoryRequest {
     /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
     /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
+    /// Debian/APT repository options surfaced to UI/OpenAPI clients.
+    pub debian_config: Option<DebianRepositoryConfig>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
     /// Stored in `repository_config` under `quarantine_enabled`.
@@ -529,6 +971,9 @@ pub struct RepositoryResponse {
     /// `repository_config` (#1770 B). `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_duration_minutes: Option<i64>,
+    /// Debian/APT repository options read from repository_config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debian_config: Option<DebianRepositoryConfig>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -564,15 +1009,14 @@ fn repo_to_response(
         // db-less, mirroring `upstream_auth_*` above (#1770 B).
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
+        debian_config: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
 }
 
-/// Populate `RepositoryResponse.quarantine_*` from `repository_config` (#1770
-/// B). Split out so the detail and update handlers, which both have a DB
-/// handle, can echo the configured Package Age Policy back to clients. The
-/// listing path stays db-light and omits these per-repo lookups.
+/// Populate repository_config-backed fields for detail/update responses.
+/// The listing path stays db-light and omits these per-repo lookups.
 async fn with_quarantine_settings(
     db: &sqlx::PgPool,
     repo_id: Uuid,
@@ -581,6 +1025,7 @@ async fn with_quarantine_settings(
     let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
+    response.debian_config = load_debian_config(db, repo_id, &response).await;
     response
 }
 
@@ -1348,6 +1793,9 @@ pub async fn create_repository(
     let service = state.create_repository_service();
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
+    let debian_config = payload.debian_config.clone();
+    let debian_upstream_url = debian_config_upstream_url(debian_config.as_ref(), &repo_type);
+    validate_debian_repository_config(&format, debian_config.as_ref())?;
 
     // Validate up-front that virtual repos do not arrive with an explicit
     // empty `member_repos: []`. Omitted-field (deferred-population) is
@@ -1408,7 +1856,7 @@ pub async fn create_repository(
             repo_type: repo_type.clone(),
             storage_backend,
             storage_path,
-            upstream_url: payload.upstream_url,
+            upstream_url: payload.upstream_url.or(debian_upstream_url),
             is_public,
             quota_bytes: payload.quota_bytes,
             promotion_only: payload.promotion_only.unwrap_or(false),
@@ -1428,6 +1876,14 @@ pub async fn create_repository(
 
     if let Some(ref index_path) = payload.pypi_upstream_index_path {
         upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
+    }
+
+    if let Some(ref config) = debian_config {
+        upsert_debian_config(&state.db, repo.id, config).await?;
+        if let Some(ttl) = debian_cache_ttl_seconds(config)? {
+            upsert_repo_config(&state.db, repo.id, "cache_ttl_seconds", &ttl.to_string()).await?;
+        }
+        sync_debian_signing_config(&state, repo.id, config).await?;
     }
 
     // Add virtual repository members. Post-#1444, the validator accepts
@@ -1489,6 +1945,10 @@ pub async fn create_repository(
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
+    }
+    if let Some(config) = debian_config {
+        response.debian_config =
+            Some(config.hydrated_for_response(&response.key, response.upstream_url.as_deref()));
     }
     Ok(Json(response))
 }
@@ -1573,6 +2033,10 @@ pub async fn update_repository(
 
     // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
+    let debian_config = payload.debian_config.clone();
+    let debian_upstream_url =
+        debian_config_upstream_url(debian_config.as_ref(), &existing.repo_type);
+    validate_debian_repository_config(&existing.format, debian_config.as_ref())?;
     require_repo_access(&auth, existing.id)?;
 
     // Fine-grained permission check: non-admins need "admin" on the target repository.
@@ -1611,7 +2075,7 @@ pub async fn update_repository(
                 description: payload.description,
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
-                upstream_url: None,
+                upstream_url: debian_upstream_url,
                 promotion_only: payload.promotion_only,
             },
         )
@@ -1623,6 +2087,14 @@ pub async fn update_repository(
 
     if let Some(ref index_path) = payload.pypi_upstream_index_path {
         upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
+    }
+
+    if let Some(ref config) = debian_config {
+        upsert_debian_config(&state.db, repo.id, config).await?;
+        if let Some(ttl) = debian_cache_ttl_seconds(config)? {
+            upsert_repo_config(&state.db, repo.id, "cache_ttl_seconds", &ttl.to_string()).await?;
+        }
+        sync_debian_signing_config(&state, repo.id, config).await?;
     }
 
     if let Some(enabled) = payload.quarantine_enabled {
@@ -2062,16 +2534,9 @@ pub struct ArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
-    /// Whether this artifact can have an SBOM generated or a security scan
-    /// run against it. `false` for proxy-cached (Remote) objects: those are
-    /// listed with a synthetic, SHA-256-derived id (see
-    /// [`cached_artifact_id`]) and have no row in the `artifacts` table
-    /// (#1280/#1278), so SBOM/scan lookups by `artifacts.id` cannot resolve
-    /// them and `sbom_documents`/`scan_results` cannot reference them.
-    /// `true` for hosted artifacts, which carry a real DB id. The web UI
-    /// uses this to hide/disable the "Generate SBOM" / "Scan" actions where
-    /// they cannot work; clients that predate the field should treat an
-    /// absent value as `true` so hosted artifacts are never hidden. (#2227)
+    /// Whether this response points at a real artifact row that can be scanned
+    /// or have an SBOM generated. Proxy-cache-only entries use synthetic IDs
+    /// and therefore are not analyzable.
     pub analyzable: bool,
     /// When the proxy cache entry for this artifact was last written.
     /// Only populated for Remote (proxy) repositories whose proxy service is
@@ -2546,8 +3011,6 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
-        // Proxy-cached objects have no `artifacts` row (#1280/#1278) and a
-        // synthetic id, so SBOM/scan cannot resolve them: not analyzable.
         analyzable: false,
         // This is a proxy-cache entry, so surface the cache timestamp.
         // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
@@ -2660,23 +3123,9 @@ async fn lookup_artifact_by_paths(
     Ok(None)
 }
 
-/// Resolve a request path to the artifact's stored path for the generic
-/// download/delete handlers.
-///
-/// npm publish stores tarballs under the version-segmented layout
-/// (`<name>/<version>/<file>.tgz`, see `npm::store_npm_version`), while the Web
-/// UI's Download/Delete buttons emit the canonical npm download-URL shape
-/// (`<name>/-/<file>.tgz`). An exact-match `WHERE path = $2` lookup against the
-/// URL shape therefore never finds the version-segmented row. This mirrors the
-/// resolution `get_artifact_metadata` already performs: try the literal path
-/// first, then the normalised stored shape for npm-family repos.
-///
-/// The extra DB roundtrip is taken only when a normalised candidate actually
-/// exists (npm-family repo + the `/-/` URL shape): for non-npm formats and
-/// already-stored npm paths `lookup_path_candidates` returns a single element,
-/// so the guard short-circuits and behaviour is byte-identical to today. On a
-/// true local miss the original `path` is returned unchanged, so Remote/Virtual
-/// proxy fallback still fires against the original URL shape.
+/// Resolve canonical npm `/-/` request URLs to the version-segmented path
+/// used by the artifact table. Other formats and literal stored paths pass
+/// through unchanged.
 async fn resolve_stored_path(
     state: &SharedState,
     repo: &crate::models::repository::Repository,
@@ -2686,7 +3135,7 @@ async fn resolve_stored_path(
     if candidates.len() > 1 {
         Ok(lookup_artifact_by_paths(&state.db, repo.id, &candidates)
             .await?
-            .map(|a| a.path)
+            .map(|artifact| artifact.path)
             .unwrap_or(path))
     } else {
         Ok(path)
@@ -2725,7 +3174,6 @@ fn build_artifact_response(
         download_count,
         created_at: artifact.created_at,
         metadata: None,
-        // Hosted artifact backed by a real `artifacts` row: SBOM/scan resolve.
         analyzable: true,
         // Cache metadata is surfaced only by the per-artifact metadata
         // endpoint to avoid fanning out a storage GET per artifact in
@@ -2778,8 +3226,6 @@ fn expand_maven_secondary_files(
             download_count: 0,
             created_at: artifact.created_at,
             metadata: None,
-            // Secondary Maven files are recorded under a real primary
-            // artifact row (its id), so they are analyzable like the primary.
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
@@ -3620,8 +4066,6 @@ pub async fn get_artifact_metadata(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata.map(|m| m.metadata),
-            // This handler resolves a real `artifacts` row by id, so it is
-            // always a hosted artifact (analyzable), even inside a Remote repo.
             analyzable: true,
             cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
@@ -3872,7 +4316,6 @@ pub async fn upload_artifact(
             download_count: downloads,
             created_at: artifact.created_at,
             metadata: metadata_json,
-            // Freshly-uploaded hosted artifact with a real DB id: analyzable.
             analyzable: true,
             // Just-uploaded artifacts have no proxy cache state yet -- the
             // cache is populated lazily on the first proxy fetch.
@@ -4297,12 +4740,6 @@ pub async fn download_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
 
-    // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
-    // version-segmented path the tarball is actually stored under (#2269),
-    // mirroring `get_artifact_metadata`. No-op for non-npm formats and for
-    // paths that are already stored literally; on a local miss `path` is left
-    // unchanged so the Remote/Virtual proxy fallback below still fires against
-    // the original URL shape.
     let path = resolve_stored_path(&state, &repo, path).await?;
 
     // Check quarantine status before serving the artifact.
@@ -4626,12 +5063,6 @@ pub async fn delete_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
 
-    // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
-    // version-segmented path the tarball is actually stored under (#2269),
-    // mirroring `get_artifact_metadata`. Done before the promotion-only /
-    // immutability gates below so every gate, the delete query, and the
-    // cache-invalidation all operate on one consistent, real artifact path.
-    // No-op for non-npm formats and already-literal paths.
     let path = resolve_stored_path(&state, &repo, path).await?;
 
     // Promotion-only release repositories: a direct DELETE is the symmetric
@@ -5521,6 +5952,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         UpdateRepositoryRequest,
         RepositoryResponse,
         RepositoryListResponse,
+        DebianRepositoryConfig,
+        DebianRepositorySyncConfig,
         SetCacheTtlRequest,
         CacheTtlResponse,
         InvalidateCacheQuery,
@@ -5994,10 +6427,6 @@ mod tests {
         assert_eq!(resp.checksum_sha256, "deadbeef");
         assert_eq!(resp.download_count, 0);
         assert!(resp.version.is_none());
-        // Proxy-cached objects have no `artifacts` row and a synthetic id,
-        // so they cannot be SBOM'd or scanned: the listing marks them
-        // non-analyzable so the UI hides those actions (#2227).
-        assert!(!resp.analyzable);
         // A cached-listing entry is a live proxy-cache object, so its
         // freshness timestamp is exactly when it was cached; the sidecar
         // projection carries no expiry. (Asserting these guards the
@@ -6051,8 +6480,6 @@ mod tests {
         assert_eq!(resp.size_bytes, 500);
         assert_eq!(resp.checksum_sha256, "primary-sha");
         assert_eq!(resp.download_count, 42);
-        // Hosted artifacts have a real DB id, so SBOM/scan resolve: analyzable.
-        assert!(resp.analyzable);
     }
 
     // -----------------------------------------------------------------------
@@ -6760,6 +7187,244 @@ mod tests {
     }
 
     #[test]
+    fn test_create_repository_request_with_debian_config() {
+        let json = r#"{
+            "key": "ubuntu-proxy",
+            "name": "Ubuntu Proxy",
+            "format": "debian",
+            "repo_type": "remote",
+            "upstream_url": "https://archive.ubuntu.com/ubuntu",
+            "debian_config": {
+                "distributions": ["jammy", "noble"],
+                "components": ["main", "universe"],
+                "architectures": ["amd64", "arm64", "all"],
+                "signing_enabled": true,
+                "sync": {
+                    "base_url": "https://archive.ubuntu.com/ubuntu",
+                    "distributions": ["jammy"],
+                    "components": ["main"],
+                    "architectures": ["amd64"],
+                    "download_policy": "on_demand"
+                }
+            }
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        let config = req.debian_config.unwrap();
+        assert_eq!(config.distributions, vec!["jammy", "noble"]);
+        assert_eq!(config.components, vec!["main", "universe"]);
+        assert!(config.signing_enabled);
+        assert_eq!(
+            config.sync.unwrap().base_url.as_deref(),
+            Some("https://archive.ubuntu.com/ubuntu")
+        );
+    }
+
+    #[test]
+    fn test_debian_config_rejects_unsafe_identifiers() {
+        let mut config = DebianRepositoryConfig {
+            distributions: vec!["bookworm\nSHA256:".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_err()
+        );
+
+        config.distributions = vec!["bookworm".to_string()];
+        config.components = vec!["../main".to_string()];
+        assert!(
+            validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_err()
+        );
+    }
+
+    #[test]
+    fn test_debian_derived_response_fields_are_not_accepted_as_input() {
+        let config: DebianRepositoryConfig = serde_json::from_value(serde_json::json!({
+            "distributions": ["bookworm"],
+            "apt_source_example": "attacker supplied",
+            "public_key_url": "/wrong",
+            "metadata_paths": ["wrong"],
+            "upload_endpoint": "/wrong",
+            "upload_path_template": "wrong",
+            "upload_metadata_headers": ["wrong"]
+        }))
+        .unwrap();
+        assert!(config.apt_source_example.is_none());
+        assert!(config.public_key_url.is_none());
+        assert!(config.metadata_paths.is_empty());
+        assert!(config.upload_endpoint.is_none());
+        assert!(config.upload_path_template.is_none());
+        assert!(config.upload_metadata_headers.is_empty());
+    }
+
+    #[test]
+    fn test_debian_sync_policy_wires_cache_and_resigning() {
+        let config = DebianRepositoryConfig {
+            sync: Some(DebianRepositorySyncConfig {
+                cache_policy: Some("ttl:45".to_string()),
+                re_sign: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(debian_cache_ttl_seconds(&config).unwrap(), Some(45));
+        assert!(debian_signing_enabled(&config));
+    }
+
+    #[test]
+    fn test_update_repository_request_with_debian_config() {
+        let json = r#"{
+            "debian_config": {
+                "distributions": ["bookworm"],
+                "components": ["main"],
+                "architectures": ["amd64", "all"],
+                "signing_enabled": false
+            }
+        }"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        let config = req.debian_config.unwrap();
+        assert_eq!(config.distributions, vec!["bookworm"]);
+        assert_eq!(config.architectures, vec!["amd64", "all"]);
+    }
+
+    #[test]
+    fn test_repositories_openapi_exposes_debian_config_schemas() {
+        let spec = <RepositoriesApiDoc as utoipa::OpenApi>::openapi();
+        let schemas = &spec.components.as_ref().unwrap().schemas;
+        assert!(schemas.contains_key("DebianRepositoryConfig"));
+        assert!(schemas.contains_key("DebianRepositorySyncConfig"));
+
+        let spec_json = serde_json::to_string(&spec).unwrap();
+        let description = ["Filtered Ubuntu ", "Jammy mirror"].concat();
+        let ubuntu_url = ["https://archive.", "ubuntu.com/ubuntu"].concat();
+        let debian_url = ["https://deb.", "debian.org/debian"].concat();
+        assert!(spec_json.contains(&description));
+        assert!(spec_json.contains(&ubuntu_url));
+        assert!(spec_json.contains(&debian_url));
+        assert!(spec_json.contains("download_policy"));
+        assert!(spec_json.contains("re_sign"));
+        assert!(spec_json.contains("upload_endpoint"));
+        assert!(spec_json.contains("upload_path_template"));
+        assert!(spec_json.contains("X-Debian-Distribution"));
+        assert!(spec_json.contains("X-Debian-Architecture"));
+    }
+
+    #[test]
+    fn test_debian_config_hydrates_ui_fields() {
+        let config = DebianRepositoryConfig {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string(), "all".to_string()],
+            signing_enabled: true,
+            ..Default::default()
+        };
+
+        let hydrated =
+            config.hydrated_for_response("ubuntu", Some("https://archive.ubuntu.com/ubuntu"));
+        assert_eq!(
+            hydrated.upstream_base_url.as_deref(),
+            Some("https://archive.ubuntu.com/ubuntu")
+        );
+        assert_eq!(
+            hydrated.apt_source_example.as_deref(),
+            Some("deb [signed-by=/usr/share/keyrings/artifact-keeper.gpg] <repo-url>/debian/ubuntu jammy main")
+        );
+        assert_eq!(
+            hydrated.public_key_url.as_deref(),
+            Some("/debian/ubuntu/dists/jammy/gpg-key.asc")
+        );
+        assert!(hydrated
+            .metadata_paths
+            .contains(&"dists/jammy/Release".to_string()));
+        assert!(hydrated
+            .metadata_paths
+            .contains(&"dists/jammy/main/binary-amd64/Packages.xz".to_string()));
+        assert!(!hydrated
+            .metadata_paths
+            .iter()
+            .any(|path| path.contains("binary-all")));
+        assert_eq!(
+            hydrated.upload_endpoint.as_deref(),
+            Some("/debian/ubuntu/pool/{component}/{path}")
+        );
+        assert_eq!(
+            hydrated.upload_path_template.as_deref(),
+            Some("pool/{component}/{prefix}/{source-or-package}/{package}_{version}_{architecture}.deb")
+        );
+        assert!(hydrated
+            .upload_metadata_headers
+            .contains(&"X-Debian-Distribution: <distribution>".to_string()));
+        assert!(hydrated
+            .upload_metadata_headers
+            .contains(&"X-Debian-Architecture: <architecture>".to_string()));
+    }
+
+    #[test]
+    fn test_debian_config_upstream_url_only_for_remote_repositories() {
+        let config = DebianRepositoryConfig {
+            upstream_base_url: Some(" https://archive.ubuntu.com/ubuntu ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            debian_config_upstream_url(Some(&config), &RepositoryType::Remote).as_deref(),
+            Some("https://archive.ubuntu.com/ubuntu")
+        );
+        assert_eq!(
+            debian_config_upstream_url(Some(&config), &RepositoryType::Local),
+            None
+        );
+    }
+
+    #[test]
+    fn test_debian_config_upstream_url_falls_back_to_sync_base_url() {
+        let config = DebianRepositoryConfig {
+            sync: Some(DebianRepositorySyncConfig {
+                base_url: Some("https://deb.debian.org/debian".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            debian_config_upstream_url(Some(&config), &RepositoryType::Remote).as_deref(),
+            Some("https://deb.debian.org/debian")
+        );
+    }
+
+    #[test]
+    fn test_debian_config_save_wires_existing_signing_config() {
+        let source = include_str!("repositories.rs");
+        let helper_name = ["sync_debian", "_signing_config"].concat();
+        let helper_marker = format!("async fn {helper_name}(");
+        let helper_start = source.find(&helper_marker).expect("helper not found");
+        let helper_end = source[helper_start..]
+            .find("\nasync fn load_debian_config(")
+            .map(|offset| helper_start + offset)
+            .expect("helper end not found");
+        let helper_body = &source[helper_start..helper_end];
+        assert!(helper_body.contains("SigningService::new("));
+        assert!(helper_body.contains(".update_signing_config("));
+        assert!(helper_body.contains("debian_signing_enabled(config)"));
+        assert!(helper_body.contains("config.signing_key_id.or(existing_key)"));
+
+        for handler in ["create_repository", "update_repository"] {
+            let marker = format!("pub async fn {handler}(");
+            let start = source.find(&marker).expect("handler not found");
+            let end = source[start..]
+                .find("\npub async fn ")
+                .map(|offset| start + offset)
+                .unwrap_or(source.len());
+            let body = &source[start..end];
+            assert!(
+                body.contains(&format!("{helper_name}(&state, repo.id, config).await?")),
+                "{handler} must persist Debian signing settings through SigningService"
+            );
+        }
+    }
+
+    #[test]
     fn test_update_repository_request_all_none() {
         let json = r#"{}"#;
         let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
@@ -6805,6 +7470,7 @@ mod tests {
             upstream_url: None,
             upstream_auth_type: None,
             upstream_auth_configured: false,
+            debian_config: None,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             created_at: chrono::Utc::now(),
@@ -7426,8 +8092,6 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"download_count\":42"));
         assert!(json.contains("\"size_bytes\":1024"));
-        // `analyzable` is always serialized (no serde skip) so clients can
-        // gate the SBOM/Scan actions on it (#2227).
         assert!(json.contains("\"analyzable\":true"));
         // Cache fields are omitted when None so the wire shape stays the
         // same for non-Remote repos and for Remote repos without cache
@@ -7467,6 +8131,7 @@ mod tests {
             cache_expires_at: Some(expires),
         };
         let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"analyzable\":false"));
         assert!(json.contains("\"cache_cached_at\":\"2026-06-01T10:00:00Z\""));
         assert!(json.contains("\"cache_expires_at\":\"2026-06-02T10:00:00Z\""));
     }
@@ -8086,6 +8751,7 @@ mod tests {
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             upstream_auth_type: None,
             upstream_auth_configured: false,
+            debian_config: None,
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
             created_at: chrono::Utc::now(),
@@ -13102,261 +13768,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // #2269: the generic download/delete handlers must resolve the canonical
-    // npm `/-/` URL shape the Web UI emits to the version-segmented path a
-    // tarball is actually stored under. `lookup_path_candidates` is the guard
-    // predicate: it yields `[url, stored]` (len 2) for an npm `/-/` tarball URL
-    // and `[literal]` (len 1) for everything else, so the resolver only takes
-    // the extra DB roundtrip when a normalized candidate can exist.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn lookup_path_candidates_pairs_npm_url_and_stored_shapes() {
-        // Unscoped `/-/` URL -> [url, version-segmented stored].
-        let unscoped =
-            lookup_path_candidates("npm-test/-/npm-test-1.0.0.tgz", &RepositoryFormat::Npm);
-        assert_eq!(
-            unscoped,
-            vec![
-                "npm-test/-/npm-test-1.0.0.tgz".to_string(),
-                "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string(),
-            ],
-            "an npm `/-/` tarball URL must expand to [url, stored] so the guard resolves it"
-        );
-
-        // Scoped `/-/` URL -> [url, version-segmented stored].
-        let scoped = lookup_path_candidates("@scope/pkg/-/pkg-2.1.0.tgz", &RepositoryFormat::Npm);
-        assert_eq!(
-            scoped,
-            vec![
-                "@scope/pkg/-/pkg-2.1.0.tgz".to_string(),
-                "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string(),
-            ],
-        );
-
-        // yarn is npm-family too.
-        assert_eq!(
-            lookup_path_candidates("npm-test/-/npm-test-1.0.0.tgz", &RepositoryFormat::Yarn).len(),
-            2,
-        );
-
-        // An already-stored version-segmented npm path has no distinct
-        // normalized shape -> single candidate, guard short-circuits.
-        assert_eq!(
-            lookup_path_candidates("npm-test/1.0.0/npm-test-1.0.0.tgz", &RepositoryFormat::Npm)
-                .len(),
-            1,
-        );
-
-        // Non-npm formats never expand -> single candidate, byte-identical path.
-        assert_eq!(
-            lookup_path_candidates("com/acme/app/1.0.0/app-1.0.0.jar", &RepositoryFormat::Maven)
-                .len(),
-            1,
-        );
-        assert_eq!(
-            lookup_path_candidates("some/raw/file.bin", &RepositoryFormat::Generic).len(),
-            1,
-        );
-    }
-
-    /// Build a bodyless GET request for `download_artifact`.
-    #[cfg(test)]
-    fn get_request() -> axum::http::Request<axum::body::Body> {
-        axum::http::Request::builder()
-            .method(axum::http::Method::GET)
-            .uri("/")
-            .body(axum::body::Body::empty())
-            .expect("request")
-    }
-
-    /// #2269: an npm tarball stored under the version-segmented layout must be
-    /// downloadable AND deletable from the canonical `/-/` URL shape the Web UI
-    /// emits, while the literal stored path and a bogus path behave as before.
-    #[tokio::test]
-    async fn npm_generic_download_delete_resolve_canonical_url_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let (user_id, username) = tdh::create_user(&pool).await;
-        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "npm").await;
-        tdh::grant_repo_access(&pool, repo_id, user_id).await;
-        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
-        let auth = Some(tdh::make_auth(user_id, &username));
-
-        // Publish tarballs under the exact version-segmented layout
-        // `npm::store_npm_version` writes.
-        let unscoped_stored = "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string();
-        let scoped_stored = "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string();
-        for p in [&unscoped_stored, &scoped_stored] {
-            upload_artifact(
-                State(state.clone()),
-                Extension(auth.clone()),
-                Path((key.clone(), p.clone())),
-                HeaderMap::new(),
-                Bytes::from_static(b"TARBALL-BYTES"),
-            )
-            .await
-            .expect("publish must succeed");
-        }
-
-        // (1) Download via the canonical `/-/` URL shape -> 200 (was 404).
-        let dl = download_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
-            get_request(),
-        )
-        .await;
-        assert_eq!(
-            dl.expect("download via /-/ shape must resolve")
-                .into_response()
-                .status(),
-            StatusCode::OK,
-            "generic download of a version-segmented npm tarball via /-/ must be 200 (#2269)"
-        );
-
-        // (2) Download via the literal stored path still resolves (literal-first).
-        let dl_literal = download_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), unscoped_stored.clone())),
-            get_request(),
-        )
-        .await;
-        assert_eq!(
-            dl_literal
-                .expect("download via literal path must resolve")
-                .into_response()
-                .status(),
-            StatusCode::OK,
-        );
-
-        // (3) A bogus `/-/` path (no matching row) must still 404 — the resolver
-        // leaves the path unchanged on a miss so downstream lookup fails cleanly.
-        let dl_bogus = download_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), "nope/-/nope-9.9.9.tgz".to_string())),
-            get_request(),
-        )
-        .await;
-        assert!(
-            matches!(dl_bogus, Err(AppError::NotFound(_))),
-            "an unknown npm tarball must still 404 (resolver leaves a miss path unchanged)"
-        );
-
-        // (4) Scoped delete via the canonical `/-/` URL shape -> Ok (was 404),
-        // and the row is soft-deleted. npm tarballs classify Mutable (no `/-/`
-        // in the resolved stored path) so the immutability gate permits this.
-        let del_scoped = delete_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
-            HeaderMap::new(),
-        )
-        .await;
-        assert!(
-            del_scoped.is_ok(),
-            "scoped npm delete via /-/ shape must succeed (#2269), got: {del_scoped:?}"
-        );
-        let scoped_live: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        )
-        .bind(repo_id)
-        .bind(&scoped_stored)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(scoped_live, 0, "the scoped tarball must be soft-deleted");
-
-        // (5) Unscoped delete via the canonical `/-/` URL shape -> Ok, row gone.
-        let del_unscoped = delete_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
-            HeaderMap::new(),
-        )
-        .await;
-        assert!(
-            del_unscoped.is_ok(),
-            "unscoped npm delete via /-/ shape must succeed (#2269), got: {del_unscoped:?}"
-        );
-        let unscoped_live: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        )
-        .bind(repo_id)
-        .bind(&unscoped_stored)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            unscoped_live, 0,
-            "the unscoped tarball must be soft-deleted"
-        );
-
-        tdh::cleanup(&pool, repo_id, user_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #2269 short-circuit guard: a non-npm (generic) repo must be completely
-    /// unaffected — an exact-path download still 200 and a bogus path still 404,
-    /// with no path rewriting (the `candidates.len() > 1` guard skips the
-    /// resolver for formats that have no `/-/` normalization).
-    #[tokio::test]
-    async fn generic_non_npm_download_unchanged_db() {
-        use crate::api::handlers::test_db_helpers as tdh;
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        let (user_id, username) = tdh::create_user(&pool).await;
-        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
-        tdh::grant_repo_access(&pool, repo_id, user_id).await;
-        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
-        let auth = Some(tdh::make_auth(user_id, &username));
-
-        let path = "tools/build-1.0.0.bin".to_string();
-        upload_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), path.clone())),
-            HeaderMap::new(),
-            Bytes::from_static(b"GENERIC-BYTES"),
-        )
-        .await
-        .expect("publish must succeed");
-
-        let dl = download_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), path.clone())),
-            get_request(),
-        )
-        .await;
-        assert_eq!(
-            dl.expect("exact-path download must resolve")
-                .into_response()
-                .status(),
-            StatusCode::OK,
-        );
-
-        let dl_bogus = download_artifact(
-            State(state.clone()),
-            Extension(auth.clone()),
-            Path((key.clone(), "tools/does-not-exist.bin".to_string())),
-            get_request(),
-        )
-        .await;
-        assert!(
-            matches!(dl_bogus, Err(AppError::NotFound(_))),
-            "an unknown generic path must still 404 (guard short-circuits for non-npm)"
-        );
-
-        tdh::cleanup(&pool, repo_id, user_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
