@@ -8,7 +8,7 @@ use bytes::Bytes;
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use tar::Archive;
 use xz2::read::XzDecoder;
@@ -452,7 +452,7 @@ pub enum DebianOperation {
 }
 
 /// Debian control file structure
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DebControl {
     pub package: String,
     pub version: String,
@@ -504,15 +504,711 @@ pub struct Release {
     #[serde(default)]
     pub md5sum: Vec<ReleaseHash>,
     #[serde(default)]
+    pub sha1: Vec<ReleaseHash>,
+    #[serde(default)]
     pub sha256: Vec<ReleaseHash>,
+    #[serde(default)]
+    pub sha512: Vec<ReleaseHash>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
 }
 
 /// Release file hash entry
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseHash {
     pub hash: String,
     pub size: u64,
     pub path: String,
+}
+
+/// Parsed Debian Packages index entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PackagesEntry {
+    pub control: DebControl,
+    pub filename: Option<String>,
+    pub size: Option<u64>,
+    pub md5sum: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
+}
+
+/// Detached Release.gpg metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseSignature {
+    pub is_armored: bool,
+    pub size: usize,
+}
+
+/// Minimal abstraction for Release metadata signing.
+pub trait DebianReleaseSigner {
+    fn sign_in_release(&self, release: &str) -> Result<String>;
+    fn sign_release_gpg(&self, release: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Generate clear-signed InRelease metadata through an injected signer.
+pub fn generate_in_release(
+    signer: &(impl DebianReleaseSigner + ?Sized),
+    release: &str,
+) -> Result<String> {
+    if release.trim().is_empty() {
+        return Err(AppError::Validation(
+            "Release content must not be empty when signing InRelease".to_string(),
+        ));
+    }
+    signer.sign_in_release(release)
+}
+
+/// Generate detached Release.gpg metadata through an injected signer.
+pub fn generate_release_gpg(
+    signer: &(impl DebianReleaseSigner + ?Sized),
+    release: &str,
+) -> Result<Vec<u8>> {
+    if release.trim().is_empty() {
+        return Err(AppError::Validation(
+            "Release content must not be empty when signing Release.gpg".to_string(),
+        ));
+    }
+    signer.sign_release_gpg(release.as_bytes())
+}
+
+/// Debian package index selected for filtered sync.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DebianIndexPath {
+    pub component: String,
+    pub architecture: String,
+    pub path: String,
+}
+
+/// Distribution/component/architecture filters for Debian remote sync.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct DebianSyncFilter {
+    pub distributions: Vec<String>,
+    pub components: Vec<String>,
+    pub architectures: Vec<String>,
+}
+
+/// Debian sync package download behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianSyncDownloadPolicy {
+    /// Cache package files only when clients request them.
+    OnDemand,
+    /// Fetch selected package files during sync.
+    Immediate,
+}
+
+impl DebianSyncDownloadPolicy {
+    pub fn from_label(label: Option<&str>) -> Self {
+        let label = label.unwrap_or_default().trim().to_ascii_lowercase();
+        match label.as_str() {
+            "immediate" | "eager" | "full" | "full_mirror" | "full-mirror" => Self::Immediate,
+            _ => Self::OnDemand,
+        }
+    }
+
+    fn downloads_packages(self) -> bool {
+        matches!(self, Self::Immediate)
+    }
+}
+
+/// Package file selected by a filtered Debian mirror sync plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DebianSyncPackageFile {
+    pub index_path: String,
+    pub filename: String,
+    pub package: String,
+    pub version: String,
+    pub architecture: String,
+    pub download: bool,
+}
+
+/// Pure filtered-sync plan produced after Release and Packages metadata are parsed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DebianSyncPlan {
+    pub distribution: String,
+    pub release_paths: Vec<String>,
+    pub package_indexes: Vec<DebianIndexPath>,
+    pub package_files: Vec<DebianSyncPackageFile>,
+    pub missing_package_indexes: Vec<String>,
+}
+
+/// Input used to decide how a Debian remote proxy cache entry should behave.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebianCacheDecisionInput<'a> {
+    pub path: &'a str,
+    pub upstream_success: bool,
+    pub cached_locally: bool,
+    pub cache_stale: bool,
+    pub checksum_matches: bool,
+}
+
+/// Cache behavior for a Debian remote proxy request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DebianCacheAction {
+    ServeCached,
+    Revalidate,
+    FetchAndCache,
+    DoNotCache,
+}
+
+/// Parse a Debian Release file.
+pub fn parse_release(content: &str) -> Result<Release> {
+    parse_release_from_payload(content)
+}
+
+/// Parse a clear-signed InRelease file.
+pub fn parse_in_release(content: &str) -> Result<Release> {
+    let payload = clear_signed_payload(content)?;
+    parse_release_from_payload(&payload)
+}
+
+/// Validate detached Release.gpg bytes and identify armored signatures.
+pub fn parse_release_gpg(content: &[u8]) -> Result<ReleaseSignature> {
+    if content.is_empty() {
+        return Err(AppError::Validation("Release.gpg is empty".to_string()));
+    }
+
+    let is_armored = std::str::from_utf8(content)
+        .map(|text| text.contains("-----BEGIN PGP SIGNATURE-----"))
+        .unwrap_or(false);
+
+    Ok(ReleaseSignature {
+        is_armored,
+        size: content.len(),
+    })
+}
+
+/// Parse an uncompressed Debian Packages file.
+pub fn parse_packages(content: &str) -> Result<Vec<PackagesEntry>> {
+    split_debian_stanzas(content)
+        .into_iter()
+        .map(parse_packages_entry)
+        .collect()
+}
+
+/// Parse a Packages index, decompressing `.gz` and `.xz` paths when needed.
+pub fn parse_packages_index(path: &str, content: &[u8]) -> Result<Vec<PackagesEntry>> {
+    let text = if path.ends_with(".gz") {
+        let mut decoder = GzDecoder::new(content);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::Validation(format!("Failed to decompress Packages.gz: {e}")))?;
+        text
+    } else if path.ends_with(".xz") {
+        let mut decoder = XzDecoder::new(content);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::Validation(format!("Failed to decompress Packages.xz: {e}")))?;
+        text
+    } else {
+        String::from_utf8(content.to_vec())
+            .map_err(|e| AppError::Validation(format!("Packages index is not UTF-8: {e}")))?
+    };
+
+    parse_packages(&text)
+}
+
+/// Return matching binary package index paths from Release metadata.
+pub fn filter_release_package_indexes(
+    release: &Release,
+    filter: &DebianSyncFilter,
+) -> Vec<DebianIndexPath> {
+    if !filter.distributions.is_empty()
+        && !filter.distributions.iter().any(|distribution| {
+            distribution == &release.suite
+                || release
+                    .codename
+                    .as_deref()
+                    .map(|codename| codename == distribution)
+                    .unwrap_or(false)
+        })
+    {
+        return Vec::new();
+    }
+
+    let component_filter: BTreeSet<&str> = filter.components.iter().map(String::as_str).collect();
+    let arch_filter: BTreeSet<&str> = filter.architectures.iter().map(String::as_str).collect();
+    let allowed_component =
+        |component: &str| component_filter.is_empty() || component_filter.contains(component);
+    let allowed_arch = |arch: &str| arch_filter.is_empty() || arch_filter.contains(arch);
+
+    let mut selected = BTreeMap::<(String, String), DebianIndexPath>::new();
+    for hash in release
+        .sha256
+        .iter()
+        .chain(release.sha512.iter())
+        .chain(release.sha1.iter())
+        .chain(release.md5sum.iter())
+    {
+        if let Some(index) = parse_release_package_index_path(&hash.path) {
+            if allowed_component(&index.component) && allowed_arch(&index.architecture) {
+                let key = (index.component.clone(), index.architecture.clone());
+                match selected.get(&key) {
+                    Some(current)
+                        if package_index_compression_rank(&current.path)
+                            >= package_index_compression_rank(&index.path) => {}
+                    _ => {
+                        selected.insert(key, index);
+                    }
+                }
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        for component in &release.components {
+            if !allowed_component(component) {
+                continue;
+            }
+            for arch in &release.architectures {
+                if allowed_arch(arch) {
+                    let path = format!("{component}/binary-{arch}/Packages.xz");
+                    selected.insert(
+                        (component.clone(), arch.clone()),
+                        DebianIndexPath {
+                            component: component.clone(),
+                            architecture: arch.clone(),
+                            path,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    selected.into_values().collect()
+}
+
+fn package_index_compression_rank(path: &str) -> u8 {
+    if path.ends_with(".xz") {
+        3
+    } else if path.ends_with(".gz") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Debian `Architecture: all` packages belong in every selected binary index.
+pub fn package_matches_sync_architecture(
+    package_arch: &str,
+    selected_architectures: &[String],
+) -> bool {
+    package_arch == "all"
+        || selected_architectures.is_empty()
+        || selected_architectures
+            .iter()
+            .any(|arch| arch == package_arch)
+}
+
+/// Build the deterministic core of a filtered Debian mirror sync.
+pub fn build_debian_sync_plan(
+    distribution: &str,
+    release: &Release,
+    filter: &DebianSyncFilter,
+    packages_by_index_path: &BTreeMap<String, Vec<PackagesEntry>>,
+    download_policy: DebianSyncDownloadPolicy,
+) -> DebianSyncPlan {
+    let package_indexes = filter_release_package_indexes(release, filter);
+    let mut package_files = Vec::new();
+    let mut missing_package_indexes = Vec::new();
+
+    for index in &package_indexes {
+        let Some(entries) = packages_by_index_path.get(&index.path) else {
+            missing_package_indexes.push(index.path.clone());
+            continue;
+        };
+
+        for entry in entries {
+            if !package_matches_sync_index(
+                &entry.control.architecture,
+                &index.architecture,
+                &filter.architectures,
+            ) {
+                continue;
+            }
+            let Some(filename) = entry
+                .filename
+                .as_deref()
+                .map(str::trim)
+                .filter(|filename| !filename.is_empty())
+            else {
+                continue;
+            };
+
+            package_files.push(DebianSyncPackageFile {
+                index_path: index.path.clone(),
+                filename: filename.to_string(),
+                package: entry.control.package.clone(),
+                version: entry.control.version.clone(),
+                architecture: entry.control.architecture.clone(),
+                download: download_policy.downloads_packages(),
+            });
+        }
+    }
+
+    package_files.sort_by(|left, right| {
+        left.index_path
+            .cmp(&right.index_path)
+            .then_with(|| left.filename.cmp(&right.filename))
+            .then_with(|| left.package.cmp(&right.package))
+    });
+    missing_package_indexes.sort();
+
+    DebianSyncPlan {
+        distribution: distribution.to_string(),
+        release_paths: vec![
+            format!("dists/{distribution}/InRelease"),
+            format!("dists/{distribution}/Release"),
+            format!("dists/{distribution}/Release.gpg"),
+        ],
+        package_indexes,
+        package_files,
+        missing_package_indexes,
+    }
+}
+
+fn package_matches_sync_index(
+    package_arch: &str,
+    index_architecture: &str,
+    selected_architectures: &[String],
+) -> bool {
+    package_arch == "all"
+        || (package_arch == index_architecture
+            && package_matches_sync_architecture(package_arch, selected_architectures))
+}
+
+/// Decide cache behavior for Debian proxy paths without performing I/O.
+pub fn decide_debian_cache_action(input: DebianCacheDecisionInput<'_>) -> DebianCacheAction {
+    if !input.upstream_success {
+        return DebianCacheAction::DoNotCache;
+    }
+
+    if input.cached_locally && is_debian_pool_artifact(input.path) && input.checksum_matches {
+        return DebianCacheAction::ServeCached;
+    }
+
+    if input.cached_locally && is_debian_metadata_path(input.path) {
+        return if input.cache_stale {
+            DebianCacheAction::Revalidate
+        } else {
+            DebianCacheAction::ServeCached
+        };
+    }
+
+    DebianCacheAction::FetchAndCache
+}
+
+fn parse_release_from_payload(content: &str) -> Result<Release> {
+    let fields = parse_debian_stanza_fields(content)?;
+    let suite = required_field(&fields, "Suite")?.to_string();
+    let date = required_field(&fields, "Date")?.to_string();
+    let architectures = split_words(fields.get("Architectures"));
+    let components = split_words(fields.get("Components"));
+
+    if architectures.is_empty() {
+        return Err(AppError::Validation(
+            "Release file missing Architectures field".to_string(),
+        ));
+    }
+    if components.is_empty() {
+        return Err(AppError::Validation(
+            "Release file missing Components field".to_string(),
+        ));
+    }
+
+    let known: BTreeSet<&str> = [
+        "Origin",
+        "Label",
+        "Suite",
+        "Codename",
+        "Version",
+        "Date",
+        "Architectures",
+        "Components",
+        "Description",
+        "MD5Sum",
+        "SHA1",
+        "SHA256",
+        "SHA512",
+    ]
+    .into_iter()
+    .collect();
+    let extra = fields
+        .iter()
+        .filter(|(key, _)| !known.contains(key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    Ok(Release {
+        origin: fields.get("Origin").cloned(),
+        label: fields.get("Label").cloned(),
+        suite,
+        codename: fields.get("Codename").cloned(),
+        version: fields.get("Version").cloned(),
+        date,
+        architectures,
+        components,
+        description: fields.get("Description").cloned(),
+        md5sum: parse_release_hashes(fields.get("MD5Sum"))?,
+        sha1: parse_release_hashes(fields.get("SHA1"))?,
+        sha256: parse_release_hashes(fields.get("SHA256"))?,
+        sha512: parse_release_hashes(fields.get("SHA512"))?,
+        extra,
+    })
+}
+
+fn clear_signed_payload(content: &str) -> Result<String> {
+    if !content.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") {
+        return Ok(content.to_string());
+    }
+
+    let mut lines = content.lines();
+    let Some(first) = lines.next() else {
+        return Err(AppError::Validation("InRelease is empty".to_string()));
+    };
+    if first != "-----BEGIN PGP SIGNED MESSAGE-----" {
+        return Err(AppError::Validation(
+            "Invalid InRelease clear-signature header".to_string(),
+        ));
+    }
+
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break;
+        }
+    }
+
+    let mut payload = String::new();
+    for line in lines {
+        if line == "-----BEGIN PGP SIGNATURE-----" {
+            break;
+        }
+        if let Some(unstuffed) = line.strip_prefix("- ") {
+            payload.push_str(unstuffed);
+        } else {
+            payload.push_str(line);
+        }
+        payload.push('\n');
+    }
+
+    if payload.trim().is_empty() {
+        return Err(AppError::Validation(
+            "InRelease missing signed Release payload".to_string(),
+        ));
+    }
+
+    Ok(payload)
+}
+
+fn parse_packages_entry(stanza: String) -> Result<PackagesEntry> {
+    let mut control = DebianHandler::parse_control(&stanza)?;
+    let filename = control.extra.remove("Filename");
+    let size = control
+        .extra
+        .remove("Size")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| AppError::Validation(format!("Invalid Packages Size value '{value}'")))
+        })
+        .transpose()?;
+    let md5sum = control.extra.remove("MD5sum");
+    let sha1 = control.extra.remove("SHA1");
+    let sha256 = control.extra.remove("SHA256");
+
+    Ok(PackagesEntry {
+        control,
+        filename,
+        size,
+        md5sum,
+        sha1,
+        sha256,
+    })
+}
+
+fn parse_debian_stanza_fields(content: &str) -> Result<BTreeMap<String, String>> {
+    let stanzas = split_debian_stanzas(content);
+    if stanzas.is_empty() {
+        return Err(AppError::Validation("Debian metadata is empty".to_string()));
+    }
+    if stanzas.len() > 1 {
+        return Err(AppError::Validation(
+            "Expected one Debian metadata stanza".to_string(),
+        ));
+    }
+    parse_field_map(&stanzas[0])
+}
+
+fn split_debian_stanzas(content: &str) -> Vec<String> {
+    let mut stanzas = Vec::new();
+    let mut current = String::new();
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            if !current.trim().is_empty() {
+                stanzas.push(current.trim_end().to_string());
+                current.clear();
+            }
+        } else {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+
+    if !current.trim().is_empty() {
+        stanzas.push(current.trim_end().to_string());
+    }
+
+    stanzas
+}
+
+fn parse_field_map(stanza: &str) -> Result<BTreeMap<String, String>> {
+    let mut fields = BTreeMap::new();
+    let mut current_key: Option<String> = None;
+    let mut current_value = String::new();
+
+    for line in stanza.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if current_key.is_none() {
+                return Err(AppError::Validation(
+                    "Debian metadata continuation without field".to_string(),
+                ));
+            }
+            current_value.push('\n');
+            current_value.push_str(line.trim_start());
+            continue;
+        }
+
+        let Some(colon_pos) = line.find(':') else {
+            return Err(AppError::Validation(format!(
+                "Malformed Debian metadata line '{line}'"
+            )));
+        };
+
+        if let Some(key) = current_key.take() {
+            fields.insert(key, current_value.trim().to_string());
+            current_value.clear();
+        }
+
+        current_key = Some(line[..colon_pos].to_string());
+        current_value.push_str(line[colon_pos + 1..].trim());
+    }
+
+    if let Some(key) = current_key {
+        fields.insert(key, current_value.trim().to_string());
+    }
+
+    Ok(fields)
+}
+
+fn required_field<'a>(fields: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> {
+    fields
+        .get(key)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Validation(format!("Release file missing {key} field")))
+}
+
+fn split_words(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_release_hashes(value: Option<&String>) -> Result<Vec<ReleaseHash>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    let mut hashes = Vec::new();
+    for line in value.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let hash = parts
+            .next()
+            .ok_or_else(|| AppError::Validation("Release hash entry missing hash".to_string()))?;
+        let size = parts
+            .next()
+            .ok_or_else(|| AppError::Validation("Release hash entry missing size".to_string()))?
+            .parse::<u64>()
+            .map_err(|_| AppError::Validation(format!("Invalid Release hash size in '{line}'")))?;
+        let path = parts
+            .next()
+            .ok_or_else(|| AppError::Validation("Release hash entry missing path".to_string()))?;
+        hashes.push(ReleaseHash {
+            hash: hash.to_string(),
+            size,
+            path: path.to_string(),
+        });
+    }
+
+    Ok(hashes)
+}
+
+fn parse_release_package_index_path(path: &str) -> Option<DebianIndexPath> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() != 3 || !parts[1].starts_with("binary-") {
+        return None;
+    }
+    let filename = parts[2];
+    if filename != "Packages" && filename != "Packages.gz" && filename != "Packages.xz" {
+        return None;
+    }
+
+    Some(DebianIndexPath {
+        component: parts[0].to_string(),
+        architecture: parts[1].trim_start_matches("binary-").to_string(),
+        path: path.to_string(),
+    })
+}
+
+fn is_debian_metadata_path(path: &str) -> bool {
+    path.starts_with("dists/")
+        && (path.ends_with("/Release")
+            || path.ends_with("/InRelease")
+            || path.ends_with("/Release.gpg")
+            || path.ends_with("/Packages")
+            || path.ends_with("/Packages.gz")
+            || path.ends_with("/Packages.xz"))
+}
+
+fn is_debian_pool_artifact(path: &str) -> bool {
+    path.starts_with("pool/") && (path.ends_with(".deb") || path.ends_with(".udeb"))
+}
+
+fn push_packages_field(entry: &mut String, key: &str, value: &str) {
+    let mut lines = value.lines();
+    let Some(first) = lines.next() else {
+        return;
+    };
+    entry.push_str(key);
+    entry.push_str(": ");
+    entry.push_str(first);
+    entry.push('\n');
+    for line in lines {
+        entry.push(' ');
+        entry.push_str(if line.is_empty() { "." } else { line });
+        entry.push('\n');
+    }
+}
+
+fn push_optional_packages_field(entry: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        push_packages_field(entry, key, value);
+    }
+}
+
+fn push_dependency_packages_field(entry: &mut String, key: &str, values: Option<&Vec<String>>) {
+    if let Some(values) = values.filter(|values| !values.is_empty()) {
+        push_packages_field(entry, key, &values.join(", "));
+    }
 }
 
 /// Generate Packages file entry
@@ -525,44 +1221,34 @@ pub fn generate_packages_entry(
 ) -> String {
     let mut entry = String::new();
 
-    entry.push_str(&format!("Package: {}\n", control.package));
-    entry.push_str(&format!("Version: {}\n", control.version));
-    entry.push_str(&format!("Architecture: {}\n", control.architecture));
-
-    if let Some(maintainer) = &control.maintainer {
-        entry.push_str(&format!("Maintainer: {}\n", maintainer));
-    }
-
+    push_packages_field(&mut entry, "Package", &control.package);
+    push_packages_field(&mut entry, "Version", &control.version);
+    push_packages_field(&mut entry, "Architecture", &control.architecture);
+    push_optional_packages_field(&mut entry, "Maintainer", control.maintainer.as_deref());
     if let Some(size) = control.installed_size {
-        entry.push_str(&format!("Installed-Size: {}\n", size));
+        push_packages_field(&mut entry, "Installed-Size", &size.to_string());
     }
-
-    if let Some(depends) = &control.depends {
-        if !depends.is_empty() {
-            entry.push_str(&format!("Depends: {}\n", depends.join(", ")));
-        }
+    push_dependency_packages_field(&mut entry, "Depends", control.depends.as_ref());
+    push_dependency_packages_field(&mut entry, "Pre-Depends", control.pre_depends.as_ref());
+    push_dependency_packages_field(&mut entry, "Recommends", control.recommends.as_ref());
+    push_dependency_packages_field(&mut entry, "Suggests", control.suggests.as_ref());
+    push_dependency_packages_field(&mut entry, "Conflicts", control.conflicts.as_ref());
+    push_dependency_packages_field(&mut entry, "Provides", control.provides.as_ref());
+    push_dependency_packages_field(&mut entry, "Replaces", control.replaces.as_ref());
+    push_optional_packages_field(&mut entry, "Section", control.section.as_deref());
+    push_optional_packages_field(&mut entry, "Priority", control.priority.as_deref());
+    push_optional_packages_field(&mut entry, "Homepage", control.homepage.as_deref());
+    push_optional_packages_field(&mut entry, "Source", control.source.as_deref());
+    let mut extra_fields: Vec<_> = control.extra.iter().collect();
+    extra_fields.sort_by_key(|(key, _)| *key);
+    for (key, value) in extra_fields {
+        push_packages_field(&mut entry, key, value);
     }
-
-    if let Some(section) = &control.section {
-        entry.push_str(&format!("Section: {}\n", section));
-    }
-
-    if let Some(priority) = &control.priority {
-        entry.push_str(&format!("Priority: {}\n", priority));
-    }
-
-    if let Some(homepage) = &control.homepage {
-        entry.push_str(&format!("Homepage: {}\n", homepage));
-    }
-
-    if let Some(description) = &control.description {
-        entry.push_str(&format!("Description: {}\n", description));
-    }
-
-    entry.push_str(&format!("Filename: {}\n", filename));
-    entry.push_str(&format!("Size: {}\n", size));
-    entry.push_str(&format!("MD5sum: {}\n", md5sum));
-    entry.push_str(&format!("SHA256: {}\n", sha256));
+    push_optional_packages_field(&mut entry, "Description", control.description.as_deref());
+    push_packages_field(&mut entry, "Filename", filename);
+    push_packages_field(&mut entry, "Size", &size.to_string());
+    push_packages_field(&mut entry, "MD5sum", md5sum);
+    push_packages_field(&mut entry, "SHA256", sha256);
 
     entry
 }
@@ -576,6 +1262,12 @@ pub fn generate_release(
     hashes: Vec<ReleaseHash>,
 ) -> String {
     let mut release = String::new();
+    let mut architectures = architectures.to_vec();
+    let mut components = components.to_vec();
+    let mut hashes = hashes;
+    architectures.sort();
+    components.sort();
+    hashes.sort_by(|a, b| a.path.cmp(&b.path));
 
     release.push_str(&format!("Suite: {}\n", suite));
     if let Some(cn) = codename {
@@ -645,6 +1337,15 @@ mod tests {
             DebianHandler::parse_deb_filename("pkg_1%3a2.0-1_amd64.deb").unwrap();
         assert_eq!(pkg, "pkg");
         assert_eq!(ver, "1%3a2.0-1");
+        assert_eq!(arch, "amd64");
+    }
+
+    #[test]
+    fn test_parse_deb_filename_debian_version_special_characters() {
+        let (pkg, ver, arch) =
+            DebianHandler::parse_deb_filename("nginx_1:1.24.0-1~ubuntu+1_amd64.deb").unwrap();
+        assert_eq!(pkg, "nginx");
+        assert_eq!(ver, "1:1.24.0-1~ubuntu+1");
         assert_eq!(arch, "amd64");
     }
 
@@ -1242,6 +1943,348 @@ Source: full-pkg-src
         assert!(release.contains("SHA256:\n"));
         assert!(release.contains(" abc123 1024 main/binary-amd64/Packages\n"));
         assert!(release.contains(" def456 512 main/binary-amd64/Packages.gz\n"));
+    }
+
+    #[test]
+    fn test_parse_release_with_hash_sections() {
+        let content = "Origin: Artifact Keeper\nLabel: Artifact Keeper\nSuite: jammy\nCodename: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64 arm64\nComponents: main universe\nDescription: Test repo\nSHA256:\n abc123 1024 main/binary-amd64/Packages\n def456 512 universe/binary-arm64/Packages.gz\nSHA512:\n fedcba 256 main/binary-amd64/Packages.xz\nX-Extra: kept\n";
+
+        let release = parse_release(content).unwrap();
+        assert_eq!(release.suite, "jammy");
+        assert_eq!(release.codename.as_deref(), Some("jammy"));
+        assert_eq!(release.architectures, vec!["amd64", "arm64"]);
+        assert_eq!(release.components, vec!["main", "universe"]);
+        assert_eq!(release.sha256.len(), 2);
+        assert_eq!(release.sha512[0].path, "main/binary-amd64/Packages.xz");
+        assert_eq!(
+            release.extra.get("X-Extra").map(String::as_str),
+            Some("kept")
+        );
+    }
+
+    #[test]
+    fn test_parse_in_release_clear_signed_payload() {
+        let content = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nSuite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n abc123 42 main/binary-amd64/Packages\n-----BEGIN PGP SIGNATURE-----\nignored\n-----END PGP SIGNATURE-----\n";
+
+        let release = parse_in_release(content).unwrap();
+        assert_eq!(release.suite, "jammy");
+        assert_eq!(release.sha256[0].size, 42);
+    }
+
+    #[test]
+    fn test_parse_release_gpg_armored() {
+        let sig =
+            parse_release_gpg(b"-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----\n")
+                .unwrap();
+        assert!(sig.is_armored);
+        assert!(sig.size > 0);
+    }
+
+    #[test]
+    fn test_generate_release_signatures_with_mock_signer() {
+        struct MockSigner;
+
+        impl DebianReleaseSigner for MockSigner {
+            fn sign_in_release(&self, release: &str) -> Result<String> {
+                Ok(format!(
+                    "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n{release}-----BEGIN PGP SIGNATURE-----\nmock\n-----END PGP SIGNATURE-----\n"
+                ))
+            }
+
+            fn sign_release_gpg(&self, release: &[u8]) -> Result<Vec<u8>> {
+                let mut signature = b"mock-detached:".to_vec();
+                signature.extend_from_slice(release);
+                Ok(signature)
+            }
+        }
+
+        let release = "Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\n";
+        let in_release = generate_in_release(&MockSigner, release).unwrap();
+        assert!(in_release.contains("-----BEGIN PGP SIGNED MESSAGE-----"));
+        assert!(in_release.contains("Suite: jammy"));
+
+        let release_gpg = generate_release_gpg(&MockSigner, release).unwrap();
+        assert!(release_gpg.starts_with(b"mock-detached:"));
+        assert!(release_gpg.ends_with(release.as_bytes()));
+    }
+
+    #[test]
+    fn test_generate_release_signatures_reject_empty_release() {
+        struct MockSigner;
+
+        impl DebianReleaseSigner for MockSigner {
+            fn sign_in_release(&self, release: &str) -> Result<String> {
+                Ok(release.to_string())
+            }
+
+            fn sign_release_gpg(&self, release: &[u8]) -> Result<Vec<u8>> {
+                Ok(release.to_vec())
+            }
+        }
+
+        assert!(generate_in_release(&MockSigner, " ").is_err());
+        assert!(generate_release_gpg(&MockSigner, "").is_err());
+    }
+
+    #[test]
+    fn test_parse_packages_index_gz() {
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let packages = "Package: nginx\nVersion: 1:1.24.0-1~ubuntu+1\nArchitecture: amd64\nDescription: Web server\n extended description\nFilename: pool/main/n/nginx/nginx_1:1.24.0-1~ubuntu+1_amd64.deb\nSize: 2048\nMD5sum: md5\nSHA1: sha1\nSHA256: sha256\n\n";
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(packages.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let parsed = parse_packages_index("main/binary-amd64/Packages.gz", &compressed).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].control.package, "nginx");
+        assert_eq!(parsed[0].control.version, "1:1.24.0-1~ubuntu+1");
+        assert_eq!(
+            parsed[0].control.description.as_deref(),
+            Some("Web server\nextended description")
+        );
+        assert_eq!(
+            parsed[0].filename.as_deref(),
+            Some("pool/main/n/nginx/nginx_1:1.24.0-1~ubuntu+1_amd64.deb")
+        );
+        assert_eq!(parsed[0].size, Some(2048));
+        assert_eq!(parsed[0].sha1.as_deref(), Some("sha1"));
+        assert_eq!(parsed[0].sha256.as_deref(), Some("sha256"));
+    }
+
+    #[test]
+    fn test_filter_release_package_indexes_by_component_and_architecture() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64 arm64\nComponents: main universe\nSHA256:\n a 1 main/binary-amd64/Packages.xz\n b 1 main/binary-arm64/Packages.xz\n c 1 universe/binary-amd64/Packages.gz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+        };
+
+        let indexes = filter_release_package_indexes(&release, &filter);
+        assert_eq!(
+            indexes,
+            vec![DebianIndexPath {
+                component: "main".to_string(),
+                architecture: "amd64".to_string(),
+                path: "main/binary-amd64/Packages.xz".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_filter_release_package_indexes_prefers_one_compressed_representation() {
+        let release = parse_release("Suite: bookworm\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n a 1 main/binary-amd64/Packages\n b 1 main/binary-amd64/Packages.gz\n c 1 main/binary-amd64/Packages.xz\n").unwrap();
+        let indexes = filter_release_package_indexes(&release, &DebianSyncFilter::default());
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].path, "main/binary-amd64/Packages.xz");
+    }
+
+    #[test]
+    fn test_filter_release_package_indexes_respects_distribution_filter() {
+        let release = parse_release("Suite: stable\nCodename: bookworm\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n a 1 main/binary-amd64/Packages.xz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+        };
+
+        assert!(filter_release_package_indexes(&release, &filter).is_empty());
+
+        let filter = DebianSyncFilter {
+            distributions: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+        };
+        assert_eq!(filter_release_package_indexes(&release, &filter).len(), 1);
+    }
+
+    #[test]
+    fn test_architecture_all_matches_selected_indexes() {
+        assert!(package_matches_sync_architecture(
+            "all",
+            &["amd64".to_string()]
+        ));
+        assert!(package_matches_sync_architecture(
+            "amd64",
+            &["amd64".to_string()]
+        ));
+        assert!(!package_matches_sync_architecture(
+            "arm64",
+            &["amd64".to_string()]
+        ));
+    }
+
+    fn packages_entry(
+        package: &str,
+        version: &str,
+        architecture: &str,
+        filename: &str,
+    ) -> PackagesEntry {
+        PackagesEntry {
+            control: DebControl {
+                package: package.to_string(),
+                version: version.to_string(),
+                architecture: architecture.to_string(),
+                ..Default::default()
+            },
+            filename: Some(filename.to_string()),
+            size: Some(128),
+            md5sum: None,
+            sha1: None,
+            sha256: Some("sha256".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_build_debian_sync_plan_filters_indexes_and_package_files() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64 arm64\nComponents: main universe\nSHA256:\n a 1 main/binary-amd64/Packages.xz\n b 1 main/binary-arm64/Packages.xz\n c 1 universe/binary-amd64/Packages.xz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string(), "arm64".to_string()],
+        };
+        let mut packages_by_index_path = BTreeMap::new();
+        packages_by_index_path.insert(
+            "main/binary-amd64/Packages.xz".to_string(),
+            vec![
+                packages_entry(
+                    "nginx",
+                    "1.0",
+                    "amd64",
+                    "pool/main/n/nginx/nginx_1.0_amd64.deb",
+                ),
+                packages_entry("docs", "1.0", "all", "pool/main/d/docs/docs_1.0_all.deb"),
+                packages_entry("bad", "1.0", "arm64", "pool/main/b/bad/bad_1.0_arm64.deb"),
+            ],
+        );
+        packages_by_index_path.insert(
+            "main/binary-arm64/Packages.xz".to_string(),
+            vec![
+                packages_entry(
+                    "nginx",
+                    "1.0",
+                    "arm64",
+                    "pool/main/n/nginx/nginx_1.0_arm64.deb",
+                ),
+                packages_entry("docs", "1.0", "all", "pool/main/d/docs/docs_1.0_all.deb"),
+            ],
+        );
+
+        let plan = build_debian_sync_plan(
+            "jammy",
+            &release,
+            &filter,
+            &packages_by_index_path,
+            DebianSyncDownloadPolicy::OnDemand,
+        );
+
+        assert_eq!(
+            plan.release_paths,
+            vec![
+                "dists/jammy/InRelease".to_string(),
+                "dists/jammy/Release".to_string(),
+                "dists/jammy/Release.gpg".to_string(),
+            ]
+        );
+        assert_eq!(plan.package_indexes.len(), 2);
+        assert!(plan.missing_package_indexes.is_empty());
+        assert_eq!(plan.package_files.len(), 4);
+        assert!(plan.package_files.iter().all(|file| !file.download));
+        assert!(plan.package_files.iter().any(|file| {
+            file.index_path == "main/binary-amd64/Packages.xz"
+                && file.package == "docs"
+                && file.architecture == "all"
+        }));
+        assert!(plan.package_files.iter().any(|file| {
+            file.index_path == "main/binary-arm64/Packages.xz"
+                && file.package == "docs"
+                && file.architecture == "all"
+        }));
+        assert!(!plan.package_files.iter().any(|file| file.package == "bad"));
+    }
+
+    #[test]
+    fn test_build_debian_sync_plan_marks_immediate_downloads_and_missing_indexes() {
+        let release = parse_release("Suite: bookworm\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n a 1 main/binary-amd64/Packages.gz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["bookworm".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+        };
+        let packages_by_index_path = BTreeMap::new();
+
+        let plan = build_debian_sync_plan(
+            "bookworm",
+            &release,
+            &filter,
+            &packages_by_index_path,
+            DebianSyncDownloadPolicy::from_label(Some("immediate")),
+        );
+
+        assert_eq!(
+            plan.missing_package_indexes,
+            vec!["main/binary-amd64/Packages.gz".to_string()]
+        );
+        assert!(plan.package_files.is_empty());
+        assert_eq!(
+            DebianSyncDownloadPolicy::from_label(Some("on_demand")),
+            DebianSyncDownloadPolicy::OnDemand
+        );
+        assert_eq!(
+            DebianSyncDownloadPolicy::from_label(Some("full-mirror")),
+            DebianSyncDownloadPolicy::Immediate
+        );
+    }
+
+    #[test]
+    fn test_debian_cache_decision_logic() {
+        assert_eq!(
+            decide_debian_cache_action(DebianCacheDecisionInput {
+                path: "pool/main/n/nginx/nginx_1.0_amd64.deb",
+                upstream_success: true,
+                cached_locally: true,
+                cache_stale: false,
+                checksum_matches: true,
+            }),
+            DebianCacheAction::ServeCached
+        );
+        assert_eq!(
+            decide_debian_cache_action(DebianCacheDecisionInput {
+                path: "dists/jammy/Release",
+                upstream_success: true,
+                cached_locally: true,
+                cache_stale: true,
+                checksum_matches: false,
+            }),
+            DebianCacheAction::Revalidate
+        );
+        assert_eq!(
+            decide_debian_cache_action(DebianCacheDecisionInput {
+                path: "dists/jammy/main/binary-amd64/Packages.gz",
+                upstream_success: true,
+                cached_locally: true,
+                cache_stale: false,
+                checksum_matches: false,
+            }),
+            DebianCacheAction::ServeCached
+        );
+        assert_eq!(
+            decide_debian_cache_action(DebianCacheDecisionInput {
+                path: "dists/jammy/Release",
+                upstream_success: false,
+                cached_locally: false,
+                cache_stale: false,
+                checksum_matches: false,
+            }),
+            DebianCacheAction::DoNotCache
+        );
+    }
+
+    #[test]
+    fn test_malformed_release_returns_error() {
+        assert!(parse_release("Suite: jammy\n").is_err());
     }
 
     // ========================================================================
