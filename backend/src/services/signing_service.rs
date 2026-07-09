@@ -275,6 +275,18 @@ pub struct CreateKeyRequest {
     pub created_by: Option<Uuid>,
 }
 
+/// Request to import a public-only OpenPGP trust anchor (no private key).
+pub struct ImportPublicKeyRequest {
+    pub repository_id: Option<Uuid>,
+    pub name: String,
+    /// ASCII-armored OpenPGP public key (e.g. Debian/Ubuntu archive key).
+    pub public_key: String,
+    pub uid_name: Option<String>,
+    pub uid_email: Option<String>,
+    pub expires_at: Option<chrono::DateTime<Utc>>,
+    pub created_by: Option<Uuid>,
+}
+
 impl SigningService {
     pub fn new(db: PgPool, encryption_key: &str) -> Self {
         Self {
@@ -343,10 +355,101 @@ impl SigningService {
             fingerprint: Some(fingerprint),
             key_id: Some(key_id),
             public_key_pem: public_key_out,
+            can_sign: true,
             algorithm: req.algorithm,
             uid_name: req.uid_name,
             uid_email: req.uid_email,
             expires_at: None,
+            is_active: true,
+            created_at: now,
+            last_used_at: None,
+        })
+    }
+
+    /// Import a public-only OpenPGP trust anchor (no private key material).
+    ///
+    /// Used for Debian/Ubuntu archive keys and other upstream verification
+    /// anchors. These keys can verify signatures but cannot sign.
+    pub async fn import_public_trust_anchor(
+        &self,
+        req: ImportPublicKeyRequest,
+    ) -> Result<SigningKeyPublic> {
+        let public_key_armored = req.public_key.trim().to_string();
+        if public_key_armored.is_empty() {
+            return Err(AppError::Validation(
+                "Public key cannot be empty".to_string(),
+            ));
+        }
+
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(AppError::Validation("Name cannot be empty".to_string()));
+        }
+
+        let public_key = parse_openpgp_public_key(&public_key_armored)?;
+        let fingerprint = hex::encode(public_key.fingerprint().as_bytes());
+        let key_id = hex::encode(public_key.key_id().as_ref());
+
+        // Reject duplicate fingerprints so re-importing the same archive key
+        // surfaces a clean Conflict instead of a unique-constraint 500.
+        let existing: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM signing_keys WHERE fingerprint = $1")
+                .bind(&fingerprint)
+                .fetch_optional(&self.db)
+                .await?;
+
+        if let Some((existing_id,)) = existing {
+            return Err(AppError::Conflict(format!(
+                "A signing key with fingerprint {} already exists (id: {})",
+                fingerprint, existing_id
+            )));
+        }
+
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let key_type = "gpg".to_string();
+        let algorithm = "public-only".to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO signing_keys (id, repository_id, name, key_type, fingerprint, key_id,
+                public_key_pem, private_key_enc, algorithm, uid_name, uid_email, is_active,
+                created_at, created_by, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, true, $11, $12, $13)
+            "#,
+        )
+        .bind(id)
+        .bind(req.repository_id)
+        .bind(&name)
+        .bind(&key_type)
+        .bind(&fingerprint)
+        .bind(&key_id)
+        .bind(&public_key_armored)
+        .bind(&algorithm)
+        .bind(&req.uid_name)
+        .bind(&req.uid_email)
+        .bind(now)
+        .bind(req.created_by)
+        .bind(req.expires_at)
+        .execute(&self.db)
+        .await?;
+
+        self.audit_key_action(id, "imported_public", req.created_by, None)
+            .await?;
+
+        Ok(SigningKeyPublic {
+            id,
+            repository_id: req.repository_id,
+            name,
+            key_type,
+            fingerprint: Some(fingerprint),
+            key_id: Some(key_id),
+            public_key_pem: public_key_armored,
+            can_sign: false,
+            algorithm,
+            uid_name: req.uid_name,
+            uid_email: req.uid_email,
+            expires_at: req.expires_at,
             is_active: true,
             created_at: now,
             last_used_at: None,
@@ -513,9 +616,15 @@ impl SigningService {
     /// `RsaSigningKey<Sha256>` both already implement `ZeroizeOnDrop` upstream
     /// in the `rsa` crate, so they self-clean when this function returns.
     pub fn sign_with_key(&self, key: &SigningKey, data: &[u8]) -> Result<Vec<u8>> {
+        let private_key_enc = key.private_key_enc.as_ref().ok_or_else(|| {
+            AppError::Validation(
+                "Cannot sign with a public-only trust anchor (no private key)".to_string(),
+            )
+        })?;
+
         // Decrypt private key into a zeroizing buffer.
         let private_pem: Zeroizing<Vec<u8>> =
-            Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
+            Zeroizing::new(self.encryption.decrypt(private_key_enc).map_err(|e| {
                 AppError::Internal(format!("Failed to decrypt private key: {}", e))
             })?);
 
@@ -577,8 +686,14 @@ impl SigningService {
             ));
         }
 
+        let private_key_enc = key.private_key_enc.as_ref().ok_or_else(|| {
+            AppError::Validation(
+                "Cannot sign with a public-only trust anchor (no private key)".to_string(),
+            )
+        })?;
+
         let private_key: Zeroizing<Vec<u8>> =
-            Zeroizing::new(self.encryption.decrypt(&key.private_key_enc).map_err(|e| {
+            Zeroizing::new(self.encryption.decrypt(private_key_enc).map_err(|e| {
                 AppError::Internal(format!("Failed to decrypt private key: {}", e))
             })?);
         let private_key_str = std::str::from_utf8(&private_key)
@@ -765,6 +880,13 @@ impl SigningService {
         .await?
         .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
 
+        if old_key.private_key_enc.is_none() {
+            return Err(AppError::Validation(
+                "Cannot rotate a public-only trust anchor; import a new public key instead"
+                    .to_string(),
+            ));
+        }
+
         // Create new key with same params
         let new_key = self
             .create_key(CreateKeyRequest {
@@ -877,7 +999,7 @@ mod tests {
             fingerprint: Some(fingerprint),
             key_id: Some(key_id),
             public_key_pem: public_pem,
-            private_key_enc: private_enc,
+            private_key_enc: Some(private_enc),
             algorithm: "rsa2048".to_string(),
             uid_name: None,
             uid_email: None,
@@ -915,7 +1037,7 @@ mod tests {
             fingerprint: Some(fingerprint),
             key_id: Some(key_id),
             public_key_pem,
-            private_key_enc: service.encryption.encrypt(private_key_material.as_bytes()),
+            private_key_enc: Some(service.encryption.encrypt(private_key_material.as_bytes())),
             algorithm: req.algorithm,
             uid_name: req.uid_name,
             uid_email: req.uid_email,
@@ -997,7 +1119,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let private_pem_bytes = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let private_pem_bytes = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1019,7 +1143,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let private_pem_bytes = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let private_pem_bytes = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1040,7 +1166,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let decrypted = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let decrypted = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let decrypted_str = std::str::from_utf8(&decrypted).unwrap();
 
         assert!(decrypted_str.contains("BEGIN PRIVATE KEY"));
@@ -1052,7 +1180,7 @@ mod tests {
         let signing_key = generate_test_signing_key("correct-passphrase");
         let wrong_encryption = CredentialEncryption::from_passphrase("wrong-passphrase");
 
-        let result = wrong_encryption.decrypt(&signing_key.private_key_enc);
+        let result = wrong_encryption.decrypt(signing_key.private_key_enc.as_ref().unwrap());
         assert!(result.is_err());
     }
 
@@ -1093,9 +1221,44 @@ mod tests {
         assert_eq!(public.fingerprint, signing_key.fingerprint);
         assert_eq!(public.key_id, signing_key.key_id);
         assert_eq!(public.public_key_pem, signing_key.public_key_pem);
+        assert!(public.can_sign);
         assert_eq!(public.algorithm, signing_key.algorithm);
         assert_eq!(public.is_active, signing_key.is_active);
         assert_eq!(public.created_at, signing_key.created_at);
+    }
+
+    #[test]
+    fn test_public_only_trust_anchor_cannot_sign() {
+        let mut key = generate_test_signing_key("public-only");
+        key.private_key_enc = None;
+        key.key_type = "gpg".to_string();
+        key.algorithm = "public-only".to_string();
+
+        let public: SigningKeyPublic = key.clone().into();
+        assert!(!public.can_sign);
+
+        let service = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase("public-only"),
+        };
+        let err = service.sign_with_key(&key, b"data").unwrap_err();
+        assert!(
+            err.to_string().contains("public-only trust anchor"),
+            "expected public-only refusal, got: {err}"
+        );
+        let err = service.load_openpgp_secret_key(&key).unwrap_err();
+        assert!(
+            err.to_string().contains("public-only trust anchor"),
+            "expected public-only refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_openpgp_public_key_rejects_empty() {
+        let err = parse_openpgp_public_key("").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to parse OpenPGP public key"));
     }
 
     // -----------------------------------------------------------------------
@@ -1472,7 +1635,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let private_pem_bytes = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let private_pem_bytes = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1494,7 +1659,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let private_pem_bytes = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let private_pem_bytes = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1516,7 +1683,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let private_pem_bytes = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let private_pem_bytes = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1539,7 +1708,9 @@ mod tests {
         let signing_key2 = generate_test_signing_key("key-2-verify");
 
         let encryption1 = CredentialEncryption::from_passphrase("key-1-verify");
-        let private_pem_bytes = encryption1.decrypt(&signing_key1.private_key_enc).unwrap();
+        let private_pem_bytes = encryption1
+            .decrypt(signing_key1.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1566,7 +1737,9 @@ mod tests {
         let signing_key = generate_test_signing_key(passphrase);
 
         let encryption = CredentialEncryption::from_passphrase(passphrase);
-        let private_pem_bytes = encryption.decrypt(&signing_key.private_key_enc).unwrap();
+        let private_pem_bytes = encryption
+            .decrypt(signing_key.private_key_enc.as_ref().unwrap())
+            .unwrap();
         let private_pem = std::str::from_utf8(&private_pem_bytes).unwrap();
         let private_key = RsaPrivateKey::from_pkcs8_pem(private_pem).unwrap();
 
@@ -1639,7 +1812,7 @@ mod tests {
     #[test]
     fn test_private_key_not_stored_plaintext() {
         let key = generate_test_signing_key("not-plaintext");
-        let enc_bytes = &key.private_key_enc;
+        let enc_bytes = key.private_key_enc.as_ref().unwrap();
         // The encrypted bytes should NOT contain the PEM header
         let enc_str = String::from_utf8_lossy(enc_bytes);
         assert!(

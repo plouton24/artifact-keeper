@@ -16,8 +16,10 @@ pub struct SigningKey {
     pub fingerprint: Option<String>,
     pub key_id: Option<String>,
     pub public_key_pem: String,
+    /// Encrypted private key material. `None` for public-only trust anchors
+    /// that can verify upstream signatures but cannot sign.
     #[serde(skip_serializing)]
-    pub private_key_enc: Vec<u8>,
+    pub private_key_enc: Option<Vec<u8>>,
     pub algorithm: String,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
@@ -39,6 +41,9 @@ pub struct SigningKeyPublic {
     pub fingerprint: Option<String>,
     pub key_id: Option<String>,
     pub public_key_pem: String,
+    /// True when this key can sign (has private material). False for
+    /// public-only trust anchors used only for upstream verification.
+    pub can_sign: bool,
     pub algorithm: String,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
@@ -58,6 +63,7 @@ impl From<SigningKey> for SigningKeyPublic {
             fingerprint: k.fingerprint,
             key_id: k.key_id,
             public_key_pem: k.public_key_pem,
+            can_sign: k.private_key_enc.is_some(),
             algorithm: k.algorithm,
             uid_name: k.uid_name,
             uid_email: k.uid_email,
@@ -100,7 +106,7 @@ mod tests {
             fingerprint: Some("ABCDEF1234567890".to_string()),
             key_id: Some("12345678".to_string()),
             public_key_pem: "-----BEGIN PGP PUBLIC KEY BLOCK-----...".to_string(),
-            private_key_enc: vec![1, 2, 3, 4, 5],
+            private_key_enc: Some(vec![1, 2, 3, 4, 5]),
             algorithm: "RSA".to_string(),
             uid_name: Some("Test User".to_string()),
             uid_email: Some("test@example.com".to_string()),
@@ -121,6 +127,7 @@ mod tests {
         assert_eq!(public.fingerprint.as_deref(), Some("ABCDEF1234567890"));
         assert_eq!(public.key_id.as_deref(), Some("12345678"));
         assert!(public.public_key_pem.contains("BEGIN PGP"));
+        assert!(public.can_sign);
         assert_eq!(public.algorithm, "RSA");
         assert_eq!(public.uid_name.as_deref(), Some("Test User"));
         assert_eq!(public.uid_email.as_deref(), Some("test@example.com"));
@@ -140,7 +147,7 @@ mod tests {
             fingerprint: None,
             key_id: None,
             public_key_pem: "PEM".to_string(),
-            private_key_enc: vec![],
+            private_key_enc: None,
             algorithm: "Ed25519".to_string(),
             uid_name: None,
             uid_email: None,
@@ -156,6 +163,7 @@ mod tests {
         assert!(public.repository_id.is_none());
         assert!(public.fingerprint.is_none());
         assert!(public.key_id.is_none());
+        assert!(!public.can_sign);
         assert!(public.uid_name.is_none());
         assert!(public.uid_email.is_none());
         assert!(!public.is_active);

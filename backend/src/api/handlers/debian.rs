@@ -1565,6 +1565,7 @@ async fn store_synced_dists_content(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn build_synced_dists_index_response(path: &str, text: String) -> Result<Response, Response> {
     let (content_type, body) = if path.ends_with(".gz") {
         let compressed = gzip_compress(text.as_bytes()).map_err(|e| {
