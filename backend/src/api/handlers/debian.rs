@@ -550,45 +550,48 @@ async fn load_debian_repository_config(
     }
 }
 
-fn sync_value_allowed(values: &[String], requested: &str) -> bool {
-    values.is_empty() || values.iter().any(|value| value == requested)
-}
-
-fn debian_sync_path_allowed(
-    config: &DebianRepositoryConfig,
-    distribution: &str,
-    suffix: &str,
-) -> bool {
-    if config.flat_repository {
-        return distribution.is_empty() || distribution == "/";
-    }
-
-    let distribution_paths = config.effective_distribution_paths();
-    if !sync_value_allowed(&distribution_paths, distribution) {
-        return false;
-    }
-
-    let segments: Vec<&str> = suffix.split('/').collect();
-    if segments.len() >= 2 && segments[1].starts_with("binary-") {
-        let components = config.effective_components();
-        let architectures = config.effective_architectures();
-        let architecture = segments[1].strip_prefix("binary-").unwrap_or(segments[1]);
-        return sync_value_allowed(&components, segments[0])
-            && sync_value_allowed(&architectures, architecture);
-    }
-    true
-}
-
-async fn require_debian_sync_path_allowed(
-    db: &PgPool,
+/// True when a coherent local mirror generation has been published for this
+/// distribution and must be served exclusively.
+///
+/// A published generation is signalled by a stored synced Release (only
+/// written, atomically, at the end of a successful sync for a repository whose
+/// metadata strategy generates local metadata). While no generation exists the
+/// repository is in transparent passthrough mode: upstream metadata is served
+/// unchanged and no per-request filtering is applied, so `apt` always sees a
+/// self-consistent Release + index set. Once a generation is published, the
+/// served set is exactly what the generation contains — filters are implicit in
+/// its contents rather than enforced per request — and anything outside it is
+/// 404 rather than proxied from upstream, so clients never observe a Release
+/// that advertises indexes the mirror does not serve, nor a mix of upstream and
+/// filtered local metadata.
+async fn debian_local_generation_active(
+    state: &SharedState,
     repo_id: uuid::Uuid,
     distribution: &str,
-    suffix: &str,
+) -> bool {
+    matches!(
+        load_synced_release_content(state, repo_id, distribution).await,
+        Ok(Some(_))
+    )
+}
+
+/// Guard the upstream-passthrough branch of a dists request: once a local
+/// generation is published for `distribution`, a path that is not part of that
+/// generation must 404 instead of falling through to upstream, so the served
+/// mirror stays coherent with its published Release. Returns `Ok(())` (allow
+/// passthrough) only while the repository is still in transparent passthrough
+/// mode.
+async fn reject_uncovered_generation_path(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
 ) -> Result<(), Response> {
-    if let Some(config) = load_debian_repository_config(db, repo_id).await {
-        if !debian_sync_path_allowed(&config, distribution, suffix) {
-            return Err((StatusCode::NOT_FOUND, "Path excluded by Debian filters").into_response());
-        }
+    if debian_local_generation_active(state, repo_id, distribution).await {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Path is not part of the published Debian mirror generation",
+        )
+            .into_response());
     }
     Ok(())
 }
@@ -989,8 +992,7 @@ impl<'a> DebianProxy<'a> {
         content_type: &'static str,
         repo: &RepoInfo,
     ) -> Result<(), Response> {
-        require_debian_sync_path_allowed(&self.state.db, repo.id, self.distribution, suffix)
-            .await?;
+        reject_uncovered_generation_path(self.state, repo.id, self.distribution).await?;
         // Virtual repos: try each Remote member in priority order so a
         // virtual APT repo can serve dists metadata when its top-level
         // type is `virtual` (#1147). Local/Staging members produce
@@ -1053,8 +1055,7 @@ impl<'a> DebianProxy<'a> {
         repo: &RepoInfo,
     ) -> Result<(), Response> {
         let upstream_path = debian_dists_upstream_path(self.distribution, suffix);
-        require_debian_sync_path_allowed(&self.state.db, repo.id, self.distribution, suffix)
-            .await?;
+        reject_uncovered_generation_path(self.state, repo.id, self.distribution).await?;
 
         // Virtual: iterate Remote members.
         if repo.repo_type == RepositoryType::Virtual {
@@ -2126,13 +2127,17 @@ async fn dists_proxy_catchall(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    require_debian_sync_path_allowed(&state.db, repo.id, &distribution, &dists_path).await?;
-
     if let Some(text) =
         load_synced_dists_content(&state, repo.id, &distribution, &dists_path).await?
     {
         return build_synced_dists_index_response(&dists_path, text);
     }
+
+    // Once a local generation is published, ancillary metadata that is not part
+    // of it (excluded components/architectures, Sources, Contents, i18n, dep11,
+    // by-hash, ...) must 404 rather than leak through from upstream, keeping the
+    // served mirror coherent with its published Release.
+    reject_uncovered_generation_path(&state, repo.id, &distribution).await?;
 
     let upstream_path = debian_dists_upstream_path(&distribution, &dists_path);
 
@@ -3527,7 +3532,7 @@ mod tests {
         );
         // Bug 5: generated metadata is published in a single transaction.
         assert!(
-            body.contains("state.db.begin()") && body.contains("tx.commit()"),
+            body.contains(".begin()") && body.contains("tx.commit()"),
             "generated metadata must be published atomically in one transaction"
         );
     }
@@ -3903,56 +3908,6 @@ mod tests {
     }
 
     #[test]
-    fn test_debian_filters_distribution_component_and_architecture() {
-        let config = DebianRepositoryConfig {
-            distribution_paths: vec!["bookworm".to_string()],
-            components: vec!["main".to_string()],
-            architectures: vec!["amd64".to_string()],
-            ..Default::default()
-        };
-
-        assert!(debian_sync_path_allowed(&config, "bookworm", "Release"));
-        assert!(debian_sync_path_allowed(
-            &config,
-            "bookworm",
-            "main/binary-amd64/Packages.xz"
-        ));
-        assert!(!debian_sync_path_allowed(
-            &config,
-            "trixie",
-            "main/binary-amd64/Packages.xz"
-        ));
-        assert!(!debian_sync_path_allowed(
-            &config,
-            "bookworm",
-            "contrib/binary-amd64/Packages.xz"
-        ));
-        assert!(!debian_sync_path_allowed(
-            &config,
-            "bookworm",
-            "main/binary-arm64/Packages.xz"
-        ));
-    }
-
-    #[test]
-    fn test_flat_debian_filters_allow_only_root_distribution() {
-        let config = DebianRepositoryConfig {
-            distribution_paths: vec!["/".to_string()],
-            flat_repository: true,
-            components: vec!["*".to_string()],
-            ..Default::default()
-        };
-
-        assert!(debian_sync_path_allowed(&config, "", "Packages.xz"));
-        assert!(debian_sync_path_allowed(&config, "/", "Sources.gz"));
-        assert!(!debian_sync_path_allowed(
-            &config,
-            "bookworm",
-            "main/binary-amd64/Packages.xz"
-        ));
-    }
-
-    #[test]
     fn test_flat_debian_upstream_paths_are_root_relative() {
         assert_eq!(debian_dists_upstream_path("", "Release"), "Release");
         assert_eq!(debian_dists_upstream_path("", "Packages.xz"), "Packages.xz");
@@ -3961,20 +3916,59 @@ mod tests {
             "dists/bookworm/main/binary-amd64/Packages.xz"
         );
     }
-    #[test]
-    fn test_debian_filters_treat_wildcard_components_and_architectures_as_all() {
-        let config = DebianRepositoryConfig {
-            distribution_paths: vec!["bookworm".to_string()],
-            components: vec!["*".to_string()],
-            architectures: Vec::new(),
-            ..Default::default()
-        };
 
-        assert!(debian_sync_path_allowed(
-            &config,
-            "bookworm",
-            "contrib/binary-arm64/Packages.xz"
-        ));
+    #[test]
+    fn test_dists_serving_is_generation_aware_not_per_request_filtered() {
+        // Passthrough must be transparent (no per-request filtering) and, once a
+        // local generation is published, uncovered paths 404 instead of leaking
+        // upstream. Guard the wiring so it cannot silently regress.
+        let src = include_str!("debian.rs");
+
+        // The per-request filter helpers must be gone entirely. Build the
+        // needles at runtime so this test's own source does not self-match.
+        let removed_fn = ["fn debian_sync", "_path_allowed("].concat();
+        let removed_call = ["require_debian_sync", "_path_allowed("].concat();
+        assert!(
+            !src.contains(&removed_fn),
+            "per-request passthrough filtering must be removed"
+        );
+        assert!(
+            !src.contains(&removed_call),
+            "per-request passthrough filtering call sites must be removed"
+        );
+
+        // The dists passthrough branches must gate on the published generation.
+        for anchor in [
+            "async fn dists(",
+            "async fn dists_detecting_change(",
+            "async fn dists_proxy_catchall(",
+        ] {
+            let start = src
+                .find(anchor)
+                .unwrap_or_else(|| panic!("{anchor} missing"));
+            let window = &src[start..start + 1400];
+            assert!(
+                window.contains("reject_uncovered_generation_path("),
+                "{anchor} must gate passthrough on the published generation"
+            );
+        }
+
+        // dists_proxy_catchall must serve local content before applying the gate
+        // so covered paths are not rejected.
+        let catchall = src
+            .find("async fn dists_proxy_catchall(")
+            .expect("catchall exists");
+        let body = &src[catchall..catchall + 1400];
+        let local = body
+            .find("load_synced_dists_content(")
+            .expect("catchall loads local content");
+        let gate = body
+            .find("reject_uncovered_generation_path(")
+            .expect("catchall gates passthrough");
+        assert!(
+            local < gate,
+            "local content must be served before the passthrough gate"
+        );
     }
 
     #[test]

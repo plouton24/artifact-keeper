@@ -660,6 +660,90 @@ impl DebianRepositoryConfig {
     }
 }
 
+/// Partial Debian config as sent to the repository *update* endpoint.
+///
+/// Remembers which keys the client actually provided so a partial update
+/// preserves omitted settings instead of resetting them to defaults. Every
+/// `DebianRepositoryConfig` field is `#[serde(default)]`, so without this the
+/// deserializer cannot tell "field omitted" from "field set to its default"
+/// and a `PATCH` that touches one setting would silently reset the rest.
+///
+/// `parsed` is the standalone interpretation (used when the repository has no
+/// stored config yet); `provided_keys` drives the merge with the stored config.
+#[derive(Debug, Clone)]
+pub struct DebianConfigPatch {
+    provided_keys: serde_json::Map<String, serde_json::Value>,
+    parsed: DebianRepositoryConfig,
+}
+
+impl<'de> Deserialize<'de> for DebianConfigPatch {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let provided_keys = match &value {
+            serde_json::Value::Object(map) => map.clone(),
+            _ => return Err(serde::de::Error::custom("debian must be a JSON object")),
+        };
+        let parsed = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            provided_keys,
+            parsed,
+        })
+    }
+}
+
+/// Overlay the keys a client explicitly provided onto the stored config's JSON
+/// so omitted fields keep their existing values. Pure and unit-tested.
+fn merge_debian_config_values(
+    mut base: serde_json::Map<String, serde_json::Value>,
+    provided: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    for (key, value) in provided {
+        base.insert(key.clone(), value.clone());
+    }
+    base
+}
+
+async fn load_stored_debian_config_value(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let stored = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key IN ('debian', 'debian_config') ORDER BY CASE WHEN key = 'debian' THEN 0 ELSE 1 END LIMIT 1",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    match serde_json::from_str::<serde_json::Value>(&stored) {
+        Ok(serde_json::Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Resolve the effective Debian config to persist for an update: merge the
+/// client's provided keys over the stored config (preserving omitted settings),
+/// or fall back to the standalone parse when the repository has no stored
+/// config yet.
+async fn resolve_debian_config_update(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    patch: DebianConfigPatch,
+) -> Result<DebianRepositoryConfig> {
+    match load_stored_debian_config_value(db, repo_id).await {
+        Some(base) => {
+            let merged = merge_debian_config_values(base, &patch.provided_keys);
+            serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| {
+                AppError::Validation(format!("Invalid Debian config after merge: {e}"))
+            })
+        }
+        None => Ok(patch.parsed),
+    }
+}
+
 fn normalized_non_empty_values(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -1138,9 +1222,12 @@ pub struct UpdateRepositoryRequest {
     /// restore the PEP 503 default, or any other non-empty string for a custom prefix.
     /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
-    /// Debian/APT repository options surfaced to UI/OpenAPI clients.
+    /// Debian/APT repository options surfaced to UI/OpenAPI clients. On update
+    /// this is a partial patch: only the keys present in the request are
+    /// applied, and any omitted settings keep their existing stored values.
     #[serde(default, alias = "debian_config")]
-    pub debian: Option<DebianRepositoryConfig>,
+    #[schema(value_type = Option<DebianRepositoryConfig>)]
+    pub debian: Option<DebianConfigPatch>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
     /// Stored in `repository_config` under `quarantine_enabled`.
@@ -2256,7 +2343,12 @@ pub async fn update_repository(
 
     // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
-    let debian_config = payload.debian.clone();
+    // Partial update: merge the provided Debian keys over the stored config so
+    // omitted settings are preserved instead of reset to defaults.
+    let debian_config = match payload.debian.clone() {
+        Some(patch) => Some(resolve_debian_config_update(&state.db, existing.id, patch).await?),
+        None => None,
+    };
     let debian_upstream_url =
         debian_config_upstream_url(debian_config.as_ref(), &existing.repo_type);
     validate_debian_repository_config(&existing.format, debian_config.as_ref())?;
@@ -7688,12 +7780,56 @@ mod tests {
             }
         }"#;
         let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
-        let config = req.debian.unwrap();
+        let config = req.debian.unwrap().parsed;
         assert_eq!(config.distribution_paths, vec!["bookworm"]);
         assert_eq!(config.architectures, vec!["amd64", "all"]);
         assert_eq!(
             config.package_fetch_strategy,
             DebianPackageFetchStrategy::PrefetchSelected
+        );
+    }
+
+    #[test]
+    fn test_debian_config_patch_records_only_provided_keys() {
+        let patch: DebianConfigPatch = serde_json::from_str(r#"{"components":["main"]}"#).unwrap();
+        assert!(patch.provided_keys.contains_key("components"));
+        assert!(!patch.provided_keys.contains_key("architectures"));
+        assert!(!patch.provided_keys.contains_key("distribution_paths"));
+    }
+
+    #[test]
+    fn test_merge_debian_config_preserves_omitted_fields() {
+        // Stored config for an already-configured mirror.
+        let base = serde_json::json!({
+            "distribution_paths": ["jammy"],
+            "components": ["main", "universe"],
+            "architectures": ["amd64", "arm64"],
+            "package_fetch_strategy": "prefetch_selected",
+            "metadata_strategy": "filter_and_generate"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        // A partial update that only narrows the architectures.
+        let patch: DebianConfigPatch =
+            serde_json::from_str(r#"{"architectures":["amd64"]}"#).unwrap();
+        let merged = merge_debian_config_values(base, &patch.provided_keys);
+        let config: DebianRepositoryConfig =
+            serde_json::from_value(serde_json::Value::Object(merged)).unwrap();
+
+        // Updated field applied.
+        assert_eq!(config.architectures, vec!["amd64"]);
+        // Omitted fields preserved (previously reset to defaults — the bug).
+        assert_eq!(config.components, vec!["main", "universe"]);
+        assert_eq!(config.distribution_paths, vec!["jammy"]);
+        assert_eq!(
+            config.package_fetch_strategy,
+            DebianPackageFetchStrategy::PrefetchSelected
+        );
+        assert_eq!(
+            config.metadata_strategy,
+            DebianMetadataStrategy::FilterAndGenerate
         );
     }
 
