@@ -778,6 +778,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.event_bus.clone(),
     );
 
+    // Spawn the scheduled/background Debian mirror synchronizer. It is a
+    // cluster-wide singleton (scheduler-lease guarded) that periodically runs
+    // the same mirror sync as POST /debian/{repo}/sync for Remote Debian
+    // repositories configured with debian.sync_interval_minutes.
+    artifact_keeper_backend::api::handlers::debian::spawn_debian_mirror_scheduler(state.clone());
+    tracing::info!("Debian mirror scheduler started");
+
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
 

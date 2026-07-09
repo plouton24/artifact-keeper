@@ -2835,6 +2835,24 @@ async fn sync_remote_repository(
             )
                 .into_response()
         })?;
+    run_debian_mirror_sync(&state, repo, repo_key, &config)
+        .await
+        .map(Json)
+}
+
+/// Run one full mirror sync pass for a configured Debian Remote repository.
+///
+/// This is the shared core behind both `POST /debian/{repo}/sync` and the
+/// background scheduler, so manual and scheduled syncs behave identically. On
+/// success it records the completion time so the scheduler can tell when the
+/// repository is next due.
+#[allow(clippy::result_large_err)]
+async fn run_debian_mirror_sync(
+    state: &SharedState,
+    repo: RepoInfo,
+    repo_key: String,
+    config: &DebianRepositoryConfig,
+) -> Result<DebianSyncResponse, Response> {
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -2929,8 +2947,8 @@ async fn sync_remote_repository(
 
         let verified_release_text = if config.verify_upstream_metadata {
             verify_upstream_release_metadata(
-                &state,
-                &config,
+                state,
+                config,
                 release_text_from_release,
                 &release_bytes,
                 in_release_bytes.as_deref(),
@@ -3112,12 +3130,165 @@ async fn sync_remote_repository(
         plans.push(plan);
     }
 
-    Ok(Json(DebianSyncResponse {
+    record_debian_sync_run(&state.db, repo.id).await;
+
+    Ok(DebianSyncResponse {
         repository: repo_key,
         plans,
         prefetched_packages: prefetched.len(),
         prefetched_sources: prefetched_sources.len(),
-    }))
+    })
+}
+
+const DEBIAN_MIRROR_SYNC_JOB: &str = "debian_mirror_sync";
+const DEBIAN_LAST_SYNC_CONFIG_KEY: &str = "debian_last_sync_at";
+
+/// Record the wall-clock completion time of a mirror sync run so the scheduler
+/// can compute when the repository is next due. Stored in `repository_config`
+/// under a dedicated key that `load_debian_repository_config` never reads, so
+/// it does not affect the repository's advanced configuration.
+async fn record_debian_sync_run(db: &PgPool, repo_id: uuid::Uuid) {
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        "#,
+    )
+    .bind(repo_id)
+    .bind(DEBIAN_LAST_SYNC_CONFIG_KEY)
+    .bind(&now)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(repository_id = %repo_id, error = %error, "failed to record Debian mirror sync timestamp");
+    }
+}
+
+/// Read the last recorded mirror sync run time, if any.
+async fn debian_last_sync_at(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let stored = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(DEBIAN_LAST_SYNC_CONFIG_KEY)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    chrono::DateTime::parse_from_rfc3339(&stored)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+/// Pure due check: has at least `interval_minutes` elapsed since the last run?
+/// A never-synced repository (`last_sync == None`) is always due. An interval
+/// of `0` is treated as disabled.
+fn debian_sync_is_due(
+    interval_minutes: u32,
+    last_sync: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if interval_minutes == 0 {
+        return false;
+    }
+    match last_sync {
+        None => true,
+        Some(last) => now >= last + chrono::Duration::minutes(i64::from(interval_minutes)),
+    }
+}
+
+/// Spawn the cluster-wide background Debian mirror scheduler.
+///
+/// A single replica at a time (guarded by a scheduler lease) wakes on a fixed
+/// cadence, finds Remote Debian repositories whose advanced configuration
+/// requests scheduled syncing, and runs the same mirror sync as the manual
+/// endpoint for the repositories that are due.
+pub fn spawn_debian_mirror_scheduler(state: SharedState) {
+    tokio::spawn(async move {
+        // Small startup delay so migrations/warm-up settle before the first tick.
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // Only one replica should drive scheduled syncs at a time. The lease
+            // TTL comfortably exceeds a single tick so a slow pass keeps its hold.
+            let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                &state.db,
+                DEBIAN_MIRROR_SYNC_JOB,
+                300.0,
+            )
+            .await
+            else {
+                continue;
+            };
+            run_due_debian_mirror_syncs(&state).await;
+            lease.release(&state.db).await;
+        }
+    });
+}
+
+/// List Remote Debian repositories and run a mirror sync for those that are
+/// both configured for scheduled syncing and currently due.
+async fn run_due_debian_mirror_syncs(state: &SharedState) {
+    let repo_keys = match sqlx::query_scalar::<_, String>(
+        "SELECT key FROM repositories \
+         WHERE format::text = 'debian' AND repo_type::text = 'remote' \
+         ORDER BY key",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(error = %error, "Debian mirror scheduler: failed to list remote repositories");
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now();
+    for repo_key in repo_keys {
+        let repo = match resolve_debian_repo(&state.db, &repo_key).await {
+            Ok(repo) => repo,
+            Err(_) => continue,
+        };
+        let Some(config) = load_debian_repository_config(&state.db, repo.id).await else {
+            continue;
+        };
+        let Some(interval) = config.scheduled_sync_interval_minutes() else {
+            continue;
+        };
+        let last_sync = debian_last_sync_at(&state.db, repo.id).await;
+        if !debian_sync_is_due(interval, last_sync, now) {
+            continue;
+        }
+
+        let repo_id = repo.id;
+        tracing::info!(repo_key = %repo_key, interval_minutes = interval, "Debian mirror scheduler: starting scheduled sync");
+        match run_debian_mirror_sync(state, repo, repo_key.clone(), &config).await {
+            Ok(summary) => {
+                tracing::info!(
+                    repo_key = %repo_key,
+                    prefetched_packages = summary.prefetched_packages,
+                    prefetched_sources = summary.prefetched_sources,
+                    "Debian mirror scheduler: scheduled sync complete"
+                );
+            }
+            Err(response) => {
+                // Record the attempt even on failure so a persistently broken
+                // upstream is retried at the configured cadence rather than on
+                // every tick.
+                record_debian_sync_run(&state.db, repo_id).await;
+                tracing::warn!(repo_key = %repo_key, status = %response.status(), "Debian mirror scheduler: scheduled sync failed");
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -3137,6 +3308,84 @@ mod tests {
         assert!(remote_branch.contains("proxy_fetch_streaming("));
     }
     use super::*;
+
+    #[test]
+    fn test_debian_sync_disabled_interval_is_never_due() {
+        let now = chrono::Utc::now();
+        assert!(!debian_sync_is_due(0, None, now));
+        assert!(!debian_sync_is_due(
+            0,
+            Some(now - chrono::Duration::days(30)),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_debian_sync_never_synced_is_due() {
+        let now = chrono::Utc::now();
+        assert!(debian_sync_is_due(60, None, now));
+    }
+
+    #[test]
+    fn test_debian_sync_due_only_after_interval_elapses() {
+        let now = chrono::Utc::now();
+        // 30 minutes ago with a 60-minute cadence is not yet due.
+        assert!(!debian_sync_is_due(
+            60,
+            Some(now - chrono::Duration::minutes(30)),
+            now
+        ));
+        // 90 minutes ago with a 60-minute cadence is due.
+        assert!(debian_sync_is_due(
+            60,
+            Some(now - chrono::Duration::minutes(90)),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_debian_sync_due_at_exact_boundary() {
+        let now = chrono::Utc::now();
+        assert!(debian_sync_is_due(
+            15,
+            Some(now - chrono::Duration::minutes(15)),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_debian_mirror_scheduler_is_wired_into_main() {
+        // Guards against the scheduler being silently dropped from startup.
+        let main_src = include_str!("../../main.rs");
+        assert!(
+            main_src.contains("spawn_debian_mirror_scheduler(state.clone())"),
+            "main.rs must spawn the Debian mirror scheduler at startup"
+        );
+    }
+
+    #[test]
+    fn test_scheduled_sync_reuses_manual_sync_core() {
+        // Both the manual endpoint and the scheduler must call the same core so
+        // their behavior cannot drift apart.
+        let src = include_str!("debian.rs");
+        let handler_start = src
+            .find("async fn sync_remote_repository(")
+            .expect("sync_remote_repository must exist");
+        let handler = &src[handler_start..handler_start + 900];
+        assert!(
+            handler.contains("run_debian_mirror_sync("),
+            "manual sync endpoint must delegate to run_debian_mirror_sync"
+        );
+
+        let scheduler_start = src
+            .find("async fn run_due_debian_mirror_syncs(")
+            .expect("run_due_debian_mirror_syncs must exist");
+        let scheduler = &src[scheduler_start..scheduler_start + 1600];
+        assert!(
+            scheduler.contains("run_debian_mirror_sync("),
+            "scheduler must delegate to run_debian_mirror_sync"
+        );
+    }
 
     fn package_entry(
         name: &str,

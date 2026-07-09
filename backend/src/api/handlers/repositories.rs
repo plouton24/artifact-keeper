@@ -384,6 +384,11 @@ pub struct ListRepositoriesQuery {
 const DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian";
 const LEGACY_DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian_config";
 
+/// Smallest scheduled mirror sync cadence accepted from the API. Scheduled
+/// syncs re-fetch upstream metadata (and optionally packages), so a floor
+/// keeps a misconfigured repository from hammering upstream mirrors.
+pub(crate) const DEBIAN_MIN_SYNC_INTERVAL_MINUTES: u32 = 5;
+
 /// Artifact Keeper-native Debian metadata behavior.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -482,6 +487,13 @@ pub struct DebianRepositoryConfig {
     /// Continue when safe if selected upstream index files are missing.
     #[serde(default)]
     pub ignore_missing_indexes: bool,
+    /// Background mirror sync cadence in minutes. When set to at least
+    /// [`DEBIAN_MIN_SYNC_INTERVAL_MINUTES`], a cluster-wide scheduler
+    /// periodically runs the same mirror sync as `POST /debian/{repo}/sync` for
+    /// this Remote repository. Omitted, null, or `0` disables scheduled syncing
+    /// and preserves the original on-request-only behavior.
+    #[serde(default)]
+    pub sync_interval_minutes: Option<u32>,
     /// Private signing key reference used only for generated local Release metadata.
     #[serde(default)]
     pub signing_key_id: Option<Uuid>,
@@ -579,6 +591,12 @@ impl DebianRepositoryConfig {
 
     pub(crate) fn generated_metadata_enabled(&self) -> bool {
         self.metadata_strategy.generates_metadata()
+    }
+
+    /// Effective scheduled sync cadence in minutes, or `None` when scheduled
+    /// syncing is disabled (field omitted, null, or `0`).
+    pub(crate) fn scheduled_sync_interval_minutes(&self) -> Option<u32> {
+        self.sync_interval_minutes.filter(|minutes| *minutes > 0)
     }
 
     pub(crate) fn component_filter_is_all(&self) -> bool {
@@ -831,6 +849,12 @@ fn debian_config_warnings(config: &DebianRepositoryConfig) -> Vec<String> {
     {
         warnings.push("Prefetch is enabled with broad component or architecture selection. Artifact Keeper may download a large number of packages and consume significant storage. Consider using cache_on_request or narrowing the filters.".to_string());
     }
+    if config.scheduled_sync_interval_minutes().is_some()
+        && !config.generated_metadata_enabled()
+        && config.package_fetch_strategy != DebianPackageFetchStrategy::PrefetchSelected
+    {
+        warnings.push("Scheduled sync is enabled but this repository neither generates metadata nor prefetches packages, so scheduled runs only refresh cached upstream indexes.".to_string());
+    }
     warnings
 }
 
@@ -896,6 +920,13 @@ fn validate_debian_repository_config(
         return Err(AppError::Validation(
             "verify_upstream_metadata=true requires upstream_gpg_key_id.".to_string(),
         ));
+    }
+    if let Some(interval) = config.sync_interval_minutes {
+        if interval != 0 && interval < DEBIAN_MIN_SYNC_INTERVAL_MINUTES {
+            return Err(AppError::Validation(format!(
+                "debian.sync_interval_minutes must be 0 (disabled) or at least {DEBIAN_MIN_SYNC_INTERVAL_MINUTES} minutes."
+            )));
+        }
     }
     Ok(())
 }
@@ -7642,6 +7673,83 @@ mod tests {
         assert!(warnings[0].starts_with("Components are set to all."));
         assert!(warnings[1].starts_with("Architectures are set to all."));
         assert!(warnings[2].starts_with("Prefetch is enabled with broad component"));
+    }
+
+    #[test]
+    fn test_debian_config_sync_interval_absent_is_disabled_by_default() {
+        // Backward compatibility: an existing config JSON with no
+        // sync_interval_minutes field must deserialize with scheduling off.
+        let config: DebianRepositoryConfig = serde_json::from_value(serde_json::json!({
+            "distribution_paths": ["jammy"]
+        }))
+        .expect("legacy config without sync field must deserialize");
+        assert_eq!(config.sync_interval_minutes, None);
+        assert_eq!(config.scheduled_sync_interval_minutes(), None);
+    }
+
+    #[test]
+    fn test_debian_config_sync_interval_zero_disables_scheduling() {
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            sync_interval_minutes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(config.scheduled_sync_interval_minutes(), None);
+    }
+
+    #[test]
+    fn test_debian_config_sync_interval_positive_enables_scheduling() {
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            sync_interval_minutes: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(config.scheduled_sync_interval_minutes(), Some(60));
+    }
+
+    #[test]
+    fn test_debian_config_rejects_sync_interval_below_minimum() {
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            sync_interval_minutes: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_err()
+        );
+    }
+
+    #[test]
+    fn test_debian_config_accepts_valid_and_disabled_sync_intervals() {
+        for minutes in [0, DEBIAN_MIN_SYNC_INTERVAL_MINUTES, 60, 1440] {
+            let config = DebianRepositoryConfig {
+                distribution_paths: vec!["jammy".to_string()],
+                sync_interval_minutes: Some(minutes),
+                ..Default::default()
+            };
+            assert!(
+                validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_ok(),
+                "interval {minutes} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_debian_config_warns_when_scheduled_sync_does_nothing_useful() {
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            sync_interval_minutes: Some(60),
+            ..Default::default()
+        };
+        let warnings = debian_config_warnings(&config);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Scheduled sync is enabled but")),
+            "expected a no-op scheduled-sync warning, got: {warnings:?}"
+        );
     }
 
     #[test]
