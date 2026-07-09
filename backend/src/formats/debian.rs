@@ -1061,7 +1061,7 @@ pub fn build_debian_sync_plan(
     }
 }
 
-fn source_file_path(directory: &str, filename: &str) -> String {
+pub(crate) fn source_file_path(directory: &str, filename: &str) -> String {
     let directory = directory.trim().trim_matches('/');
     if directory.is_empty() || directory == "." {
         filename.trim_start_matches('/').to_string()

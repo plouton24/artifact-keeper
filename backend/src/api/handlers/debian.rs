@@ -798,6 +798,139 @@ fn calculate_sha512_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
+fn calculate_sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(digest)
+}
+
+/// Strongest advertised digest for `index_path` in the Release metadata,
+/// preferring SHA-512 over SHA-256. Returns `(is_sha512, hex, size)`.
+fn release_index_digest<'a>(
+    release: &'a crate::formats::debian::Release,
+    index_path: &str,
+) -> Option<(bool, &'a str, u64)> {
+    if let Some(hash) = release.sha512.iter().find(|hash| hash.path == index_path) {
+        return Some((true, hash.hash.as_str(), hash.size));
+    }
+    if let Some(hash) = release.sha256.iter().find(|hash| hash.path == index_path) {
+        return Some((false, hash.hash.as_str(), hash.size));
+    }
+    None
+}
+
+/// Verify a downloaded Packages/Sources index against the size and strongest
+/// digest advertised in the Release metadata.
+///
+/// When `require` is true (the upstream Release was cryptographically
+/// verified), an index with no SHA256/SHA512 entry in Release is rejected so
+/// unverifiable content never enters a trusted mirror. When false, the check
+/// still runs opportunistically to catch truncated or corrupt downloads but a
+/// missing entry is tolerated.
+fn verify_index_against_release(
+    release: &crate::formats::debian::Release,
+    index_path: &str,
+    content: &[u8],
+    require: bool,
+) -> std::result::Result<(), String> {
+    match release_index_digest(release, index_path) {
+        Some((is_sha512, expected_hex, expected_size)) => {
+            if content.len() as u64 != expected_size {
+                return Err(format!(
+                    "index {index_path} size {} does not match Release size {expected_size}",
+                    content.len()
+                ));
+            }
+            let actual = if is_sha512 {
+                calculate_sha512_hex(content)
+            } else {
+                calculate_sha256_hex(content)
+            };
+            if !actual.eq_ignore_ascii_case(expected_hex) {
+                return Err(format!(
+                    "index {index_path} {} checksum does not match Release",
+                    if is_sha512 { "SHA512" } else { "SHA256" }
+                ));
+            }
+            Ok(())
+        }
+        None if require => Err(format!(
+            "index {index_path} has no SHA256/SHA512 entry in the verified Release"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Build a `Filename` -> lowercase SHA-256 map from parsed Packages indexes so
+/// prefetched `.deb` payloads can be digest-gated before entering the cache.
+fn package_sha256_by_filename(
+    packages_by_index_path: &BTreeMap<String, Vec<PackagesEntry>>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for entries in packages_by_index_path.values() {
+        for entry in entries {
+            let filename = entry
+                .filename
+                .as_deref()
+                .map(str::trim)
+                .filter(|filename| !filename.is_empty());
+            let sha256 = entry
+                .sha256
+                .as_deref()
+                .map(str::trim)
+                .filter(|sha256| !sha256.is_empty());
+            if let (Some(filename), Some(sha256)) = (filename, sha256) {
+                map.insert(filename.to_string(), sha256.to_ascii_lowercase());
+            }
+        }
+    }
+    map
+}
+
+/// Resolve the expected SHA-256 to gate a prefetched artifact's cache commit.
+///
+/// When `require` is true (upstream metadata was verified) an artifact with no
+/// advertised SHA-256 is rejected, so a trusted mirror never caches a payload
+/// it cannot verify. When false, a missing digest yields `None`, matching the
+/// prior best-effort caching for unverified remotes.
+fn expected_prefetch_digest(
+    digests: &BTreeMap<String, String>,
+    filename: &str,
+    require: bool,
+) -> std::result::Result<Option<String>, String> {
+    match digests.get(filename) {
+        Some(sha256) => Ok(Some(sha256.clone())),
+        None if require => Err(format!(
+            "{filename} has no advertised SHA256 in the verified metadata; refusing to cache"
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Build a source-file-path -> lowercase SHA-256 map from parsed Sources
+/// indexes, keyed identically to `DebianSyncSourceFile::filename`.
+fn source_sha256_by_filename(
+    sources_by_index_path: &BTreeMap<String, Vec<SourcesEntry>>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for entries in sources_by_index_path.values() {
+        for entry in entries {
+            for file in &entry.files {
+                if let Some(sha256) = file
+                    .sha256
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|sha256| !sha256.is_empty())
+                {
+                    let path =
+                        crate::formats::debian::source_file_path(&entry.directory, &file.filename);
+                    map.insert(path, sha256.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    map
+}
+
 fn push_release_hash_section<F>(
     release: &mut String,
     section: &str,
@@ -1326,7 +1459,7 @@ async fn load_synced_release_content(
 }
 
 async fn store_synced_release_content(
-    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo_id: uuid::Uuid,
     distribution: &str,
     release: &str,
@@ -1342,7 +1475,7 @@ async fn store_synced_release_content(
     .bind(repo_id)
     .bind(synced_release_config_key(distribution))
     .bind(release)
-    .execute(db)
+    .execute(&mut **tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
     Ok(())
@@ -1394,21 +1527,21 @@ async fn load_synced_dists_content(
 }
 
 async fn clear_synced_dists_content(
-    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo_id: uuid::Uuid,
     distribution: &str,
 ) -> Result<(), Response> {
     sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key LIKE $2")
         .bind(repo_id)
         .bind(format!("{}%", synced_dists_key_prefix(distribution)))
-        .execute(db)
+        .execute(&mut **tx)
         .await
         .map_err(crate::api::handlers::db_err)?;
     Ok(())
 }
 
 async fn store_synced_dists_content(
-    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo_id: uuid::Uuid,
     distribution: &str,
     path: &str,
@@ -1425,7 +1558,7 @@ async fn store_synced_dists_content(
     .bind(repo_id)
     .bind(synced_dists_config_key(distribution, path))
     .bind(content)
-    .execute(db)
+    .execute(&mut **tx)
     .await
     .map_err(crate::api::handlers::db_err)?;
     Ok(())
@@ -2850,6 +2983,18 @@ async fn sync_remote_repository(
             .into_response()
     })?;
 
+    // Defense in depth (validation also enforces this at save time): refuse to
+    // generate/sign a local Release from upstream metadata that was not
+    // cryptographically verified, so unsafe content cannot be re-signed with
+    // Artifact Keeper's trusted key.
+    if config.signing_enabled() && !config.verify_upstream_metadata {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Refusing to sign Debian metadata from an unverified upstream: set verify_upstream_metadata=true.",
+        )
+            .into_response());
+    }
+
     let distributions = config.effective_distribution_paths();
     if distributions.is_empty() {
         return Err((
@@ -2964,6 +3109,13 @@ async fn sync_remote_repository(
             .await
             {
                 Ok((content, _)) => {
+                    verify_index_against_release(
+                        &release,
+                        &index.path,
+                        &content,
+                        config.verify_upstream_metadata,
+                    )
+                    .map_err(|error| debian_sync_verification_error("Packages index", error))?;
                     let packages = parse_packages_index(&index.path, &content)
                         .map_err(|error| debian_sync_parse_error("Packages index", error))?;
                     packages_by_index_path.insert(index.path.clone(), packages);
@@ -2997,6 +3149,13 @@ async fn sync_remote_repository(
             .await
             {
                 Ok((content, _)) => {
+                    verify_index_against_release(
+                        &release,
+                        &index.path,
+                        &content,
+                        config.verify_upstream_metadata,
+                    )
+                    .map_err(|error| debian_sync_verification_error("Sources index", error))?;
                     let sources = parse_sources_index(&index.path, &content)
                         .map_err(|error| debian_sync_parse_error("Sources index", error))?;
                     sources_by_index_path.insert(index.path.clone(), sources);
@@ -3035,18 +3194,6 @@ async fn sync_remote_repository(
                     .into_response()
             })?;
 
-            clear_synced_dists_content(&state.db, repo.id, normalized_distribution).await?;
-            for (path, content) in &generated.plain_indexes {
-                store_synced_dists_content(
-                    &state.db,
-                    repo.id,
-                    normalized_distribution,
-                    path,
-                    content,
-                )
-                .await?;
-            }
-
             let components: BTreeSet<String> = plan
                 .package_indexes
                 .iter()
@@ -3070,43 +3217,89 @@ async fn sync_remote_repository(
                 &architectures,
                 generated.release_files,
             );
+
+            // Publish the generated indexes and their matching Release as one
+            // atomic generation. Without a transaction, the old rows are deleted
+            // and the new ones inserted individually, so a concurrent apt client
+            // could observe a new Release alongside stale/partial Packages (or
+            // vice versa) and fail with a hash mismatch. Committing all rows
+            // together means readers only ever see the previous complete
+            // generation or the new complete one.
+            let mut tx = state
+                .db
+                .begin()
+                .await
+                .map_err(crate::api::handlers::db_err)?;
+            clear_synced_dists_content(&mut tx, repo.id, normalized_distribution).await?;
+            for (path, content) in &generated.plain_indexes {
+                store_synced_dists_content(
+                    &mut tx,
+                    repo.id,
+                    normalized_distribution,
+                    path,
+                    content,
+                )
+                .await?;
+            }
             store_synced_release_content(
-                &state.db,
+                &mut tx,
                 repo.id,
                 normalized_distribution,
                 &filtered_release,
             )
             .await?;
+            tx.commit().await.map_err(crate::api::handlers::db_err)?;
         }
+
+        let package_digests = package_sha256_by_filename(&packages_by_index_path);
+        let source_digests = source_sha256_by_filename(&sources_by_index_path);
 
         for package in plan.package_files.iter().filter(|package| package.download) {
             if !prefetched.insert(package.filename.clone()) {
                 continue;
             }
-            let response = proxy_helpers::proxy_fetch_streaming(
+            let expected = expected_prefetch_digest(
+                &package_digests,
+                &package.filename,
+                config.verify_upstream_metadata,
+            )
+            .map_err(|error| debian_sync_verification_error("package", error))?;
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                 proxy,
                 repo.id,
                 &repo_key,
                 upstream_url,
                 &package.filename,
-                DEBIAN_BINARY_CONTENT_TYPE,
+                &package.filename,
+                expected,
             )
             .await?;
+            let response =
+                proxy_helpers::stream_fetch_result(result, DEBIAN_BINARY_CONTENT_TYPE, None)?;
             drain_prefetched_package(response).await?;
         }
         for source in plan.source_files.iter().filter(|source| source.download) {
             if !prefetched_sources.insert(source.filename.clone()) {
                 continue;
             }
-            let response = proxy_helpers::proxy_fetch_streaming(
+            let expected = expected_prefetch_digest(
+                &source_digests,
+                &source.filename,
+                config.verify_upstream_metadata,
+            )
+            .map_err(|error| debian_sync_verification_error("source file", error))?;
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
                 proxy,
                 repo.id,
                 &repo_key,
                 upstream_url,
                 &source.filename,
-                "application/octet-stream",
+                &source.filename,
+                expected,
             )
             .await?;
+            let response =
+                proxy_helpers::stream_fetch_result(result, "application/octet-stream", None)?;
             drain_prefetched_package(response).await?;
         }
         plans.push(plan);
@@ -3137,6 +3330,207 @@ mod tests {
         assert!(remote_branch.contains("proxy_fetch_streaming("));
     }
     use super::*;
+
+    fn release_with_index(index_path: &str, content: &[u8]) -> crate::formats::debian::Release {
+        let text = format!(
+            "Suite: jammy\nCodename: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n {} {} {}\n",
+            calculate_sha256_hex(content),
+            content.len(),
+            index_path,
+        );
+        parse_release(&text).expect("release parses")
+    }
+
+    #[test]
+    fn test_verify_index_against_release_accepts_matching_bytes() {
+        let content = b"Package: nginx\n";
+        let release = release_with_index("main/binary-amd64/Packages", content);
+        assert!(verify_index_against_release(
+            &release,
+            "main/binary-amd64/Packages",
+            content,
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_verify_index_against_release_rejects_size_mismatch() {
+        let content = b"Package: nginx\n";
+        let release = release_with_index("main/binary-amd64/Packages", content);
+        let tampered = b"Package: nginx\nextra";
+        let err =
+            verify_index_against_release(&release, "main/binary-amd64/Packages", tampered, true)
+                .unwrap_err();
+        assert!(err.contains("size"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_verify_index_against_release_rejects_hash_mismatch() {
+        let content = b"Package: nginx\n";
+        let release = release_with_index("main/binary-amd64/Packages", content);
+        // Same length, different bytes -> size matches but checksum does not.
+        let tampered = b"Package: redis\n";
+        assert_eq!(content.len(), tampered.len());
+        let err =
+            verify_index_against_release(&release, "main/binary-amd64/Packages", tampered, true)
+                .unwrap_err();
+        assert!(err.contains("checksum"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_verify_index_against_release_missing_entry_fails_closed_when_required() {
+        let content = b"Package: nginx\n";
+        let release = release_with_index("main/binary-amd64/Packages", content);
+        // A path with no Release entry is rejected only when verification is required.
+        assert!(verify_index_against_release(
+            &release,
+            "main/binary-arm64/Packages",
+            content,
+            true
+        )
+        .is_err());
+        assert!(verify_index_against_release(
+            &release,
+            "main/binary-arm64/Packages",
+            content,
+            false
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_release_index_digest_prefers_sha512() {
+        let content = b"Packages body\n";
+        let text = format!(
+            "Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n deadbeef {} main/binary-amd64/Packages\nSHA512:\n {} {} main/binary-amd64/Packages\n",
+            content.len(),
+            calculate_sha512_hex(content),
+            content.len(),
+        );
+        let release = parse_release(&text).unwrap();
+        let (is_sha512, _, _) =
+            release_index_digest(&release, "main/binary-amd64/Packages").expect("digest present");
+        assert!(is_sha512, "must prefer the stronger SHA512 digest");
+        // And verification succeeds against the (correct) SHA512 even though the
+        // SHA256 entry is bogus.
+        assert!(verify_index_against_release(
+            &release,
+            "main/binary-amd64/Packages",
+            content,
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_package_and_source_digest_maps() {
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            "main/binary-amd64/Packages".to_string(),
+            vec![PackagesEntry {
+                control: DebControl {
+                    package: "nginx".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "amd64".to_string(),
+                    ..DebControl::default()
+                },
+                filename: Some("pool/main/n/nginx/nginx_1.0_amd64.deb".to_string()),
+                size: Some(10),
+                md5sum: None,
+                sha1: None,
+                sha256: Some("ABCDEF".to_string()),
+            }],
+        );
+        let pkg_map = package_sha256_by_filename(&packages);
+        assert_eq!(
+            pkg_map.get("pool/main/n/nginx/nginx_1.0_amd64.deb"),
+            Some(&"abcdef".to_string()),
+            "digest must be normalized to lowercase and keyed by Filename"
+        );
+
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "main/source/Sources".to_string(),
+            vec![SourcesEntry {
+                package: "nginx".to_string(),
+                version: "1.0".to_string(),
+                directory: "pool/main/n/nginx".to_string(),
+                files: vec![SourceFileEntry {
+                    filename: "nginx_1.0.dsc".to_string(),
+                    size: 20,
+                    md5sum: None,
+                    sha1: None,
+                    sha256: Some("FEEDBEEF".to_string()),
+                    sha512: None,
+                }],
+                extra: BTreeMap::new(),
+            }],
+        );
+        let src_map = source_sha256_by_filename(&sources);
+        assert_eq!(
+            src_map.get("pool/main/n/nginx/nginx_1.0.dsc"),
+            Some(&"feedbeef".to_string()),
+            "source digest must be keyed by full directory/filename path"
+        );
+    }
+
+    #[test]
+    fn test_expected_prefetch_digest_semantics() {
+        let mut digests = BTreeMap::new();
+        digests.insert("pool/main/a.deb".to_string(), "abc123".to_string());
+
+        assert_eq!(
+            expected_prefetch_digest(&digests, "pool/main/a.deb", true).unwrap(),
+            Some("abc123".to_string())
+        );
+        // Missing digest is fatal only when verification is required.
+        assert!(expected_prefetch_digest(&digests, "pool/main/missing.deb", true).is_err());
+        assert_eq!(
+            expected_prefetch_digest(&digests, "pool/main/missing.deb", false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sync_verifies_indexes_and_gates_prefetch_and_publishes_atomically() {
+        // Structural guards so the security fixes cannot silently regress.
+        let src = include_str!("debian.rs");
+        let fn_start = src
+            .find("async fn sync_remote_repository(")
+            .expect("sync_remote_repository must exist");
+        let body = &src[fn_start..];
+        let end = body
+            .find("\n#[cfg(test)]")
+            .map(|idx| fn_start + idx)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..end];
+
+        // Bug 2: never sign metadata derived from an unverified upstream.
+        assert!(
+            body.contains("config.signing_enabled() && !config.verify_upstream_metadata"),
+            "sync must refuse to sign metadata from an unverified upstream"
+        );
+        // Bug 3: fetched indexes are verified against the Release hashes.
+        assert!(
+            body.matches("verify_index_against_release(").count() >= 2,
+            "both Packages and Sources indexes must be verified against Release"
+        );
+        // Bug 4: prefetched artifacts are digest-gated before caching.
+        assert!(
+            body.contains("proxy_fetch_streaming_with_cache_key_verified("),
+            "prefetch must use the digest-gated streaming helper"
+        );
+        assert!(
+            !body.contains("proxy_helpers::proxy_fetch_streaming(\n"),
+            "prefetch must not use the un-verified streaming helper"
+        );
+        // Bug 5: generated metadata is published in a single transaction.
+        assert!(
+            body.contains("state.db.begin()") && body.contains("tx.commit()"),
+            "generated metadata must be published atomically in one transaction"
+        );
+    }
 
     fn package_entry(
         name: &str,
