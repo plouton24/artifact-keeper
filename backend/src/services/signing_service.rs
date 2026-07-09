@@ -198,6 +198,53 @@ fn sign_openpgp_cleartext_blocking(
         })
 }
 
+fn parse_openpgp_public_key(public_key: &str) -> Result<SignedPublicKey> {
+    let (public_key, _) = SignedPublicKey::from_string(public_key)
+        .map_err(|e| AppError::Validation(format!("Failed to parse OpenPGP public key: {}", e)))?;
+    public_key.verify().map_err(|e| {
+        AppError::Validation(format!("OpenPGP public key self-check failed: {}", e))
+    })?;
+    Ok(public_key)
+}
+
+fn verify_openpgp_detached_blocking(
+    public_key: String,
+    data: Vec<u8>,
+    signature: Vec<u8>,
+) -> Result<()> {
+    let public_key = parse_openpgp_public_key(&public_key)?;
+    let signature = std::str::from_utf8(&signature).map_err(|e| {
+        AppError::Validation(format!("OpenPGP signature is not valid UTF-8: {}", e))
+    })?;
+    let (signature, _) = StandaloneSignature::from_string(signature).map_err(|e| {
+        AppError::Validation(format!("Failed to parse OpenPGP detached signature: {}", e))
+    })?;
+    signature.verify(&public_key, &data).map_err(|e| {
+        AppError::Validation(format!(
+            "OpenPGP detached signature verification failed: {}",
+            e
+        ))
+    })?;
+    Ok(())
+}
+
+fn verify_openpgp_cleartext_blocking(public_key: String, message: String) -> Result<String> {
+    let public_key = parse_openpgp_public_key(&public_key)?;
+    let (message, _) = CleartextSignedMessage::from_string(&message).map_err(|e| {
+        AppError::Validation(format!(
+            "Failed to parse OpenPGP cleartext signature: {}",
+            e
+        ))
+    })?;
+    message.verify(&public_key).map_err(|e| {
+        AppError::Validation(format!(
+            "OpenPGP cleartext signature verification failed: {}",
+            e
+        ))
+    })?;
+    Ok(message.signed_text())
+}
+
 /// Helper to dispatch a CPU-bound crypto closure to the blocking pool and
 /// convert a panic into an `AppError::Internal`. Centralizes the
 /// `spawn_blocking` join-error handling so callers stay readable.
@@ -583,6 +630,59 @@ impl SigningService {
         .await
     }
 
+    /// Find an active stored public key by UUID, short key ID, fingerprint, or name.
+    pub async fn get_public_key_by_reference(&self, reference: &str) -> Result<Option<String>> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Ok(None);
+        }
+
+        let key = sqlx::query_as::<_, SigningKey>(
+            r#"
+            SELECT * FROM signing_keys
+            WHERE is_active = true
+              AND (id::text = $1 OR key_id = $1 OR fingerprint = $1 OR name = $1)
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(reference)
+        .fetch_optional(&self.db)
+        .await?;
+
+        Ok(key.map(|key| key.public_key_pem))
+    }
+
+    /// Verify an ASCII-armored detached OpenPGP signature with a stored public key.
+    pub async fn verify_openpgp_detached_with_public_key(
+        &self,
+        public_key: &str,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<()> {
+        let public_key = public_key.to_string();
+        let data = data.to_vec();
+        let signature = signature.to_vec();
+        run_blocking("openpgp_verify_detached", move || {
+            verify_openpgp_detached_blocking(public_key, data, signature)
+        })
+        .await
+    }
+
+    /// Verify an ASCII-armored cleartext OpenPGP message and return its signed text.
+    pub async fn verify_openpgp_cleartext_with_public_key(
+        &self,
+        public_key: &str,
+        message: &str,
+    ) -> Result<String> {
+        let public_key = public_key.to_string();
+        let message = message.to_string();
+        run_blocking("openpgp_verify_cleartext", move || {
+            verify_openpgp_cleartext_blocking(public_key, message)
+        })
+        .await
+    }
+
     /// Stamp the `last_used_at` column for `key_id`. Public so callers
     /// that sign through the `_with_key` path can still record usage.
     pub async fn mark_key_used(&self, key_id: Uuid) -> Result<()> {
@@ -857,6 +957,28 @@ mod tests {
             .unwrap();
         let (message, _) = CleartextSignedMessage::from_string(&cleartext).unwrap();
         message.verify(&public_key).unwrap();
+
+        service
+            .verify_openpgp_detached_with_public_key(&key.public_key_pem, data, detached.as_bytes())
+            .await
+            .unwrap();
+        assert!(service
+            .verify_openpgp_detached_with_public_key(
+                &key.public_key_pem,
+                b"Origin: tampered\n",
+                detached.as_bytes(),
+            )
+            .await
+            .is_err());
+
+        let verified_cleartext = service
+            .verify_openpgp_cleartext_with_public_key(&key.public_key_pem, &cleartext)
+            .await
+            .unwrap();
+        assert_eq!(
+            verified_cleartext.replace("\r\n", "\n"),
+            std::str::from_utf8(data).unwrap()
+        );
     }
 
     // -----------------------------------------------------------------------

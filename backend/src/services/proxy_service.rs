@@ -2560,6 +2560,34 @@ impl ProxyService {
         self.fetch_artifact_streaming_with_cache_path(repo, path, path)
             .await
     }
+    /// Stream an artifact directly from upstream without reading or writing
+    /// the proxy cache. Format handlers use this only for explicit
+    /// passthrough package policies; normal remotes keep the cached streaming
+    /// path above.
+    pub async fn fetch_artifact_streaming_uncached(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<StreamingFetchResult> {
+        let quarantine_config = quarantine_service::resolve_config(&self.db, repo.id).await;
+        if quarantine_service::should_quarantine(&quarantine_config) {
+            return Err(AppError::Conflict(
+                "Artifact is quarantined and pending security review".to_string(),
+            ));
+        }
+
+        let upstream_url = Self::remote_target(repo)?;
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let upstream = self
+            .fetch_from_upstream_streaming(&full_url, repo.id)
+            .await?;
+
+        Ok(StreamingFetchResult {
+            body: upstream.body,
+            content_type: upstream.content_type,
+            content_length: upstream.content_length,
+        })
+    }
 
     /// Streaming sibling of [`Self::fetch_artifact_with_cache_path`]: fetch
     /// from upstream using `fetch_path` for the URL but key the proxy cache
