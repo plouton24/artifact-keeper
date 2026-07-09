@@ -1227,8 +1227,8 @@ mod tests {
         assert_eq!(public.created_at, signing_key.created_at);
     }
 
-    #[test]
-    fn test_public_only_trust_anchor_cannot_sign() {
+    #[tokio::test]
+    async fn test_public_only_trust_anchor_cannot_sign() {
         let mut key = generate_test_signing_key("public-only");
         key.private_key_enc = None;
         key.key_type = "gpg".to_string();
