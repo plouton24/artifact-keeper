@@ -531,6 +531,27 @@ pub struct PackagesEntry {
     pub sha1: Option<String>,
     pub sha256: Option<String>,
 }
+/// Source file listed by a Debian Sources index.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceFileEntry {
+    pub filename: String,
+    pub size: u64,
+    pub md5sum: Option<String>,
+    pub sha1: Option<String>,
+    pub sha256: Option<String>,
+    pub sha512: Option<String>,
+}
+
+/// Parsed Debian Sources index entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourcesEntry {
+    pub package: String,
+    pub version: String,
+    pub directory: String,
+    pub files: Vec<SourceFileEntry>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, String>,
+}
 
 /// Detached Release.gpg metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -585,6 +606,7 @@ pub struct DebianSyncFilter {
     pub distributions: Vec<String>,
     pub components: Vec<String>,
     pub architectures: Vec<String>,
+    pub include_source_packages: bool,
 }
 
 /// Debian sync package download behavior.
@@ -621,6 +643,23 @@ pub struct DebianSyncPackageFile {
     pub architecture: String,
     pub download: bool,
 }
+/// Debian source index selected for filtered sync.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DebianSourceIndexPath {
+    pub component: String,
+    pub path: String,
+}
+
+/// Source file selected by a filtered Debian mirror sync plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DebianSyncSourceFile {
+    pub index_path: String,
+    pub filename: String,
+    pub package: String,
+    pub version: String,
+    pub size: u64,
+    pub download: bool,
+}
 
 /// Pure filtered-sync plan produced after Release and Packages metadata are parsed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -628,8 +667,11 @@ pub struct DebianSyncPlan {
     pub distribution: String,
     pub release_paths: Vec<String>,
     pub package_indexes: Vec<DebianIndexPath>,
+    pub source_indexes: Vec<DebianSourceIndexPath>,
     pub package_files: Vec<DebianSyncPackageFile>,
+    pub source_files: Vec<DebianSyncSourceFile>,
     pub missing_package_indexes: Vec<String>,
+    pub missing_source_indexes: Vec<String>,
 }
 
 /// Input used to decide how a Debian remote proxy cache entry should behave.
@@ -686,30 +728,46 @@ pub fn parse_packages(content: &str) -> Result<Vec<PackagesEntry>> {
         .collect()
 }
 
-/// Parse a Packages index, decompressing `.gz` and `.xz` paths when needed.
-pub fn parse_packages_index(path: &str, content: &[u8]) -> Result<Vec<PackagesEntry>> {
-    let text = if path.ends_with(".gz") {
+fn decode_debian_index_text(path: &str, content: &[u8], label: &str) -> Result<String> {
+    if path.ends_with(".gz") {
         let mut decoder = GzDecoder::new(content);
         let mut text = String::new();
         decoder
             .read_to_string(&mut text)
-            .map_err(|e| AppError::Validation(format!("Failed to decompress Packages.gz: {e}")))?;
-        text
+            .map_err(|e| AppError::Validation(format!("Failed to decompress {label}.gz: {e}")))?;
+        Ok(text)
     } else if path.ends_with(".xz") {
         let mut decoder = XzDecoder::new(content);
         let mut text = String::new();
         decoder
             .read_to_string(&mut text)
-            .map_err(|e| AppError::Validation(format!("Failed to decompress Packages.xz: {e}")))?;
-        text
+            .map_err(|e| AppError::Validation(format!("Failed to decompress {label}.xz: {e}")))?;
+        Ok(text)
     } else {
         String::from_utf8(content.to_vec())
-            .map_err(|e| AppError::Validation(format!("Packages index is not UTF-8: {e}")))?
-    };
+            .map_err(|e| AppError::Validation(format!("{label} index is not UTF-8: {e}")))
+    }
+}
 
+/// Parse a Packages index, decompressing `.gz` and `.xz` paths when needed.
+pub fn parse_packages_index(path: &str, content: &[u8]) -> Result<Vec<PackagesEntry>> {
+    let text = decode_debian_index_text(path, content, "Packages")?;
     parse_packages(&text)
 }
 
+/// Parse an uncompressed Debian Sources file.
+pub fn parse_sources(content: &str) -> Result<Vec<SourcesEntry>> {
+    split_debian_stanzas(content)
+        .into_iter()
+        .map(parse_sources_entry)
+        .collect()
+}
+
+/// Parse a Sources index, decompressing `.gz` and `.xz` paths when needed.
+pub fn parse_sources_index(path: &str, content: &[u8]) -> Result<Vec<SourcesEntry>> {
+    let text = decode_debian_index_text(path, content, "Sources")?;
+    parse_sources(&text)
+}
 /// Return matching binary package index paths from Release metadata.
 pub fn filter_release_package_indexes(
     release: &Release,
@@ -743,7 +801,9 @@ pub fn filter_release_package_indexes(
         .chain(release.md5sum.iter())
     {
         if let Some(index) = parse_release_package_index_path(&hash.path) {
-            if allowed_component(&index.component) && allowed_arch(&index.architecture) {
+            if allowed_component(&index.component)
+                && (index.architecture.is_empty() || allowed_arch(&index.architecture))
+            {
                 let key = (index.component.clone(), index.architecture.clone());
                 match selected.get(&key) {
                     Some(current)
@@ -781,6 +841,97 @@ pub fn filter_release_package_indexes(
     selected.into_values().collect()
 }
 
+/// Return matching source package index paths from Release metadata.
+pub fn filter_release_source_indexes(
+    release: &Release,
+    filter: &DebianSyncFilter,
+) -> Vec<DebianSourceIndexPath> {
+    if !filter.include_source_packages {
+        return Vec::new();
+    }
+    let component_filter: BTreeSet<&str> = filter.components.iter().map(String::as_str).collect();
+    let allowed_component =
+        |component: &str| component_filter.is_empty() || component_filter.contains(component);
+
+    let mut selected = BTreeMap::<String, DebianSourceIndexPath>::new();
+    for hash in release
+        .sha256
+        .iter()
+        .chain(release.sha512.iter())
+        .chain(release.sha1.iter())
+        .chain(release.md5sum.iter())
+    {
+        if let Some(index) = parse_release_source_index_path(&hash.path) {
+            if allowed_component(&index.component) {
+                match selected.get(&index.component) {
+                    Some(current)
+                        if package_index_compression_rank(&current.path)
+                            >= package_index_compression_rank(&index.path) => {}
+                    _ => {
+                        selected.insert(index.component.clone(), index);
+                    }
+                }
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        for component in &release.components {
+            if allowed_component(component) {
+                selected.insert(
+                    component.clone(),
+                    DebianSourceIndexPath {
+                        component: component.clone(),
+                        path: format!("{component}/source/Sources.xz"),
+                    },
+                );
+            }
+        }
+    }
+
+    selected.into_values().collect()
+}
+pub fn validate_release_filter_selection(
+    release: &Release,
+    filter: &DebianSyncFilter,
+) -> Result<()> {
+    let missing_components = missing_release_filter_values(&filter.components, &release.components);
+    if !missing_components.is_empty() {
+        return Err(AppError::Validation(format!(
+            "Selected Debian component(s) not advertised by upstream Release metadata: {}",
+            missing_components.join(", ")
+        )));
+    }
+
+    let missing_architectures =
+        missing_release_filter_values(&filter.architectures, &release.architectures);
+    if !missing_architectures.is_empty() {
+        return Err(AppError::Validation(format!(
+            "Selected Debian architecture(s) not advertised by upstream Release metadata: {}",
+            missing_architectures.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn missing_release_filter_values(selected: &[String], advertised: &[String]) -> Vec<String> {
+    let selected: BTreeSet<String> = selected
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && *value != "*")
+        .map(str::to_string)
+        .collect();
+    if selected.is_empty() {
+        return Vec::new();
+    }
+
+    let advertised: BTreeSet<&str> = advertised.iter().map(String::as_str).collect();
+    selected
+        .into_iter()
+        .filter(|value| !advertised.contains(value.as_str()))
+        .collect()
+}
 fn package_index_compression_rank(path: &str) -> u8 {
     if path.ends_with(".xz") {
         3
@@ -809,11 +960,15 @@ pub fn build_debian_sync_plan(
     release: &Release,
     filter: &DebianSyncFilter,
     packages_by_index_path: &BTreeMap<String, Vec<PackagesEntry>>,
+    sources_by_index_path: &BTreeMap<String, Vec<SourcesEntry>>,
     download_policy: DebianSyncDownloadPolicy,
 ) -> DebianSyncPlan {
     let package_indexes = filter_release_package_indexes(release, filter);
+    let source_indexes = filter_release_source_indexes(release, filter);
     let mut package_files = Vec::new();
+    let mut source_files = Vec::new();
     let mut missing_package_indexes = Vec::new();
+    let mut missing_source_indexes = Vec::new();
 
     for index in &package_indexes {
         let Some(entries) = packages_by_index_path.get(&index.path) else {
@@ -849,32 +1004,80 @@ pub fn build_debian_sync_plan(
         }
     }
 
+    for index in &source_indexes {
+        let Some(entries) = sources_by_index_path.get(&index.path) else {
+            missing_source_indexes.push(index.path.clone());
+            continue;
+        };
+
+        for entry in entries {
+            for file in &entry.files {
+                source_files.push(DebianSyncSourceFile {
+                    index_path: index.path.clone(),
+                    filename: source_file_path(&entry.directory, &file.filename),
+                    package: entry.package.clone(),
+                    version: entry.version.clone(),
+                    size: file.size,
+                    download: download_policy.downloads_packages(),
+                });
+            }
+        }
+    }
+
     package_files.sort_by(|left, right| {
         left.index_path
             .cmp(&right.index_path)
             .then_with(|| left.filename.cmp(&right.filename))
             .then_with(|| left.package.cmp(&right.package))
     });
+    source_files.sort_by(|left, right| {
+        left.index_path
+            .cmp(&right.index_path)
+            .then_with(|| left.filename.cmp(&right.filename))
+            .then_with(|| left.package.cmp(&right.package))
+    });
     missing_package_indexes.sort();
+    missing_source_indexes.sort();
+
+    let release_prefix = if distribution.is_empty() {
+        String::new()
+    } else {
+        format!("dists/{distribution}/")
+    };
 
     DebianSyncPlan {
         distribution: distribution.to_string(),
         release_paths: vec![
-            format!("dists/{distribution}/InRelease"),
-            format!("dists/{distribution}/Release"),
-            format!("dists/{distribution}/Release.gpg"),
+            format!("{release_prefix}InRelease"),
+            format!("{release_prefix}Release"),
+            format!("{release_prefix}Release.gpg"),
         ],
         package_indexes,
+        source_indexes,
         package_files,
+        source_files,
         missing_package_indexes,
+        missing_source_indexes,
     }
 }
 
+fn source_file_path(directory: &str, filename: &str) -> String {
+    let directory = directory.trim().trim_matches('/');
+    if directory.is_empty() || directory == "." {
+        filename.trim_start_matches('/').to_string()
+    } else {
+        format!("{}/{}", directory, filename.trim_start_matches('/'))
+    }
+}
 fn package_matches_sync_index(
     package_arch: &str,
     index_architecture: &str,
     selected_architectures: &[String],
 ) -> bool {
+    if index_architecture.is_empty() {
+        return package_matches_sync_architecture(package_arch, selected_architectures);
+    }
+
     package_arch == "all"
         || (package_arch == index_architecture
             && package_matches_sync_architecture(package_arch, selected_architectures))
@@ -911,11 +1114,6 @@ fn parse_release_from_payload(content: &str) -> Result<Release> {
     if architectures.is_empty() {
         return Err(AppError::Validation(
             "Release file missing Architectures field".to_string(),
-        ));
-    }
-    if components.is_empty() {
-        return Err(AppError::Validation(
-            "Release file missing Components field".to_string(),
         ));
     }
 
@@ -1026,6 +1224,86 @@ fn parse_packages_entry(stanza: String) -> Result<PackagesEntry> {
         md5sum,
         sha1,
         sha256,
+    })
+}
+
+fn parse_source_file_hashes(
+    value: Option<String>,
+    field_name: &str,
+) -> Result<BTreeMap<String, (String, u64)>> {
+    let mut entries = BTreeMap::new();
+    let Some(value) = value else {
+        return Ok(entries);
+    };
+    for line in value.lines().filter(|line| !line.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let hash = parts
+            .next()
+            .ok_or_else(|| AppError::Validation(format!("{field_name} entry missing hash")))?;
+        let size = parts
+            .next()
+            .ok_or_else(|| AppError::Validation(format!("{field_name} entry missing size")))?
+            .parse::<u64>()
+            .map_err(|_| AppError::Validation(format!("Invalid {field_name} size in '{line}'")))?;
+        let filename = parts
+            .next()
+            .ok_or_else(|| AppError::Validation(format!("{field_name} entry missing filename")))?;
+        entries.insert(filename.to_string(), (hash.to_string(), size));
+    }
+    Ok(entries)
+}
+
+fn parse_sources_entry(stanza: String) -> Result<SourcesEntry> {
+    let mut fields = parse_field_map(&stanza)?;
+    let package = fields
+        .remove("Package")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Validation("Sources entry missing Package field".to_string()))?;
+    let version = fields
+        .remove("Version")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Validation("Sources entry missing Version field".to_string()))?;
+    let directory = fields
+        .remove("Directory")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Validation("Sources entry missing Directory field".to_string()))?;
+
+    let md5 = parse_source_file_hashes(fields.remove("Files"), "Files")?;
+    let sha1 = parse_source_file_hashes(fields.remove("Checksums-Sha1"), "Checksums-Sha1")?;
+    let sha256 = parse_source_file_hashes(fields.remove("Checksums-Sha256"), "Checksums-Sha256")?;
+    let sha512 = parse_source_file_hashes(fields.remove("Checksums-Sha512"), "Checksums-Sha512")?;
+
+    let mut filenames = BTreeSet::new();
+    filenames.extend(md5.keys().cloned());
+    filenames.extend(sha1.keys().cloned());
+    filenames.extend(sha256.keys().cloned());
+    filenames.extend(sha512.keys().cloned());
+
+    let mut files = Vec::new();
+    for filename in filenames {
+        let size = sha256
+            .get(&filename)
+            .or_else(|| sha512.get(&filename))
+            .or_else(|| sha1.get(&filename))
+            .or_else(|| md5.get(&filename))
+            .map(|(_, size)| *size)
+            .unwrap_or(0);
+        files.push(SourceFileEntry {
+            filename: filename.clone(),
+            size,
+            md5sum: md5.get(&filename).map(|(hash, _)| hash.clone()),
+            sha1: sha1.get(&filename).map(|(hash, _)| hash.clone()),
+            sha256: sha256.get(&filename).map(|(hash, _)| hash.clone()),
+            sha512: sha512.get(&filename).map(|(hash, _)| hash.clone()),
+        });
+    }
+
+    Ok(SourcesEntry {
+        package,
+        version,
+        directory,
+        files,
+        extra: fields,
     })
 }
 
@@ -1154,6 +1432,18 @@ fn parse_release_hashes(value: Option<&String>) -> Result<Vec<ReleaseHash>> {
 
 fn parse_release_package_index_path(path: &str) -> Option<DebianIndexPath> {
     let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() == 1 {
+        let filename = parts[0];
+        if filename != "Packages" && filename != "Packages.gz" && filename != "Packages.xz" {
+            return None;
+        }
+        return Some(DebianIndexPath {
+            component: String::new(),
+            architecture: String::new(),
+            path: path.to_string(),
+        });
+    }
+
     if parts.len() != 3 || !parts[1].starts_with("binary-") {
         return None;
     }
@@ -1169,14 +1459,54 @@ fn parse_release_package_index_path(path: &str) -> Option<DebianIndexPath> {
     })
 }
 
+fn parse_release_source_index_path(path: &str) -> Option<DebianSourceIndexPath> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() == 1 {
+        let filename = parts[0];
+        if filename != "Sources" && filename != "Sources.gz" && filename != "Sources.xz" {
+            return None;
+        }
+        return Some(DebianSourceIndexPath {
+            component: String::new(),
+            path: path.to_string(),
+        });
+    }
+
+    if parts.len() != 3 || parts[1] != "source" {
+        return None;
+    }
+    let filename = parts[2];
+    if filename != "Sources" && filename != "Sources.gz" && filename != "Sources.xz" {
+        return None;
+    }
+
+    Some(DebianSourceIndexPath {
+        component: parts[0].to_string(),
+        path: path.to_string(),
+    })
+}
 fn is_debian_metadata_path(path: &str) -> bool {
-    path.starts_with("dists/")
+    matches!(
+        path,
+        "Release"
+            | "InRelease"
+            | "Release.gpg"
+            | "Packages"
+            | "Packages.gz"
+            | "Packages.xz"
+            | "Sources"
+            | "Sources.gz"
+            | "Sources.xz"
+    ) || (path.starts_with("dists/")
         && (path.ends_with("/Release")
             || path.ends_with("/InRelease")
             || path.ends_with("/Release.gpg")
             || path.ends_with("/Packages")
             || path.ends_with("/Packages.gz")
-            || path.ends_with("/Packages.xz"))
+            || path.ends_with("/Packages.xz")
+            || path.ends_with("/Sources")
+            || path.ends_with("/Sources.gz")
+            || path.ends_with("/Sources.xz")))
 }
 
 fn is_debian_pool_artifact(path: &str) -> bool {
@@ -2054,12 +2384,47 @@ Source: full-pkg-src
     }
 
     #[test]
+    fn test_parse_sources_index_preserves_hashes_and_unknown_fields() {
+        let sources = "Package: nginx\nBinary: nginx\nVersion: 1.0-1\nMaintainer: Example Maintainer <maintainer@example.invalid>\nDirectory: pool/main/n/nginx\nFiles:\n md5dsc 11 nginx_1.0-1.dsc\n md5tar 22 nginx_1.0.orig.tar.xz\nChecksums-Sha1:\n sha1dsc 11 nginx_1.0-1.dsc\nChecksums-Sha256:\n sha256dsc 11 nginx_1.0-1.dsc\n sha256tar 22 nginx_1.0.orig.tar.xz\nChecksums-Sha512:\n sha512dsc 11 nginx_1.0-1.dsc\nX-Kept: yes\n\n";
+
+        let parsed = parse_sources_index("main/source/Sources", sources.as_bytes()).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].package, "nginx");
+        assert_eq!(parsed[0].version, "1.0-1");
+        assert_eq!(parsed[0].directory, "pool/main/n/nginx");
+        assert_eq!(
+            parsed[0].extra.get("Binary").map(String::as_str),
+            Some("nginx")
+        );
+        assert_eq!(
+            parsed[0].extra.get("X-Kept").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(parsed[0].files.len(), 2);
+        assert!(parsed[0].files.iter().any(|file| {
+            file.filename == "nginx_1.0-1.dsc"
+                && file.size == 11
+                && file.md5sum.as_deref() == Some("md5dsc")
+                && file.sha1.as_deref() == Some("sha1dsc")
+                && file.sha256.as_deref() == Some("sha256dsc")
+                && file.sha512.as_deref() == Some("sha512dsc")
+        }));
+        assert!(parsed[0].files.iter().any(|file| {
+            file.filename == "nginx_1.0.orig.tar.xz"
+                && file.size == 22
+                && file.md5sum.as_deref() == Some("md5tar")
+                && file.sha256.as_deref() == Some("sha256tar")
+        }));
+    }
+    #[test]
     fn test_filter_release_package_indexes_by_component_and_architecture() {
         let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64 arm64\nComponents: main universe\nSHA256:\n a 1 main/binary-amd64/Packages.xz\n b 1 main/binary-arm64/Packages.xz\n c 1 universe/binary-amd64/Packages.gz\n").unwrap();
         let filter = DebianSyncFilter {
             distributions: vec!["jammy".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
         };
 
         let indexes = filter_release_package_indexes(&release, &filter);
@@ -2088,6 +2453,7 @@ Source: full-pkg-src
             distributions: vec!["jammy".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
         };
 
         assert!(filter_release_package_indexes(&release, &filter).is_empty());
@@ -2096,10 +2462,121 @@ Source: full-pkg-src
             distributions: vec!["bookworm".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
         };
         assert_eq!(filter_release_package_indexes(&release, &filter).len(), 1);
     }
 
+    #[test]
+    fn test_validate_release_filter_selection_rejects_missing_component() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["universe".to_string()],
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
+        };
+
+        let err = validate_release_filter_selection(&release, &filter).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Selected Debian component(s) not advertised"));
+    }
+
+    #[test]
+    fn test_validate_release_filter_selection_rejects_missing_architecture() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["arm64".to_string()],
+            include_source_packages: false,
+        };
+
+        let err = validate_release_filter_selection(&release, &filter).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Selected Debian architecture(s) not advertised"));
+    }
+    #[test]
+    fn test_filter_release_source_indexes_requires_source_flag() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main universe\nSHA256:\n a 1 main/source/Sources\n b 1 main/source/Sources.gz\n c 1 main/source/Sources.xz\n d 1 universe/source/Sources.xz\n").unwrap();
+        let mut filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
+        };
+
+        assert!(filter_release_source_indexes(&release, &filter).is_empty());
+
+        filter.include_source_packages = true;
+        let indexes = filter_release_source_indexes(&release, &filter);
+        assert_eq!(
+            indexes,
+            vec![DebianSourceIndexPath {
+                component: "main".to_string(),
+                path: "main/source/Sources.xz".to_string(),
+            }]
+        );
+    }
+    #[test]
+    fn test_flat_release_indexes_are_selected_without_distribution_filter() {
+        let release = parse_release("Suite: stable\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nSHA256:\n a 1 Packages\n b 1 Packages.gz\n c 1 Packages.xz\n d 1 Sources.xz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: Vec::new(),
+            components: Vec::new(),
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: true,
+        };
+
+        let package_indexes = filter_release_package_indexes(&release, &filter);
+        assert_eq!(
+            package_indexes,
+            vec![DebianIndexPath {
+                component: String::new(),
+                architecture: String::new(),
+                path: "Packages.xz".to_string(),
+            }]
+        );
+
+        let source_indexes = filter_release_source_indexes(&release, &filter);
+        assert_eq!(
+            source_indexes,
+            vec![DebianSourceIndexPath {
+                component: String::new(),
+                path: "Sources.xz".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_flat_metadata_paths_are_classified_as_debian_metadata() {
+        assert!(is_debian_metadata_path("Release"));
+        assert!(is_debian_metadata_path("Packages.xz"));
+        assert!(is_debian_metadata_path("Sources.gz"));
+        assert!(!is_debian_metadata_path(
+            "pool/main/n/nginx/nginx_1.0_amd64.deb"
+        ));
+    }
+    #[test]
+    fn test_flat_sync_index_filters_package_architectures() {
+        assert!(package_matches_sync_index(
+            "amd64",
+            "",
+            &["amd64".to_string()]
+        ));
+        assert!(package_matches_sync_index(
+            "all",
+            "",
+            &["amd64".to_string()]
+        ));
+        assert!(!package_matches_sync_index(
+            "arm64",
+            "",
+            &["amd64".to_string()]
+        ));
+    }
     #[test]
     fn test_architecture_all_matches_selected_indexes() {
         assert!(package_matches_sync_architecture(
@@ -2144,6 +2621,7 @@ Source: full-pkg-src
             distributions: vec!["jammy".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string(), "arm64".to_string()],
+            include_source_packages: false,
         };
         let mut packages_by_index_path = BTreeMap::new();
         packages_by_index_path.insert(
@@ -2177,6 +2655,7 @@ Source: full-pkg-src
             &release,
             &filter,
             &packages_by_index_path,
+            &BTreeMap::new(),
             DebianSyncDownloadPolicy::OnDemand,
         );
 
@@ -2206,12 +2685,64 @@ Source: full-pkg-src
     }
 
     #[test]
+    fn test_build_debian_sync_plan_includes_source_files_when_enabled() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n a 1 main/binary-amd64/Packages.xz\n b 1 main/source/Sources.xz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: true,
+        };
+        let packages_by_index_path = BTreeMap::new();
+        let mut sources_by_index_path = BTreeMap::new();
+        sources_by_index_path.insert(
+            "main/source/Sources.xz".to_string(),
+            vec![SourcesEntry {
+                package: "nginx".to_string(),
+                version: "1.0-1".to_string(),
+                directory: "pool/main/n/nginx".to_string(),
+                files: vec![SourceFileEntry {
+                    filename: "nginx_1.0-1.dsc".to_string(),
+                    size: 11,
+                    md5sum: Some("md5dsc".to_string()),
+                    sha1: None,
+                    sha256: Some("sha256dsc".to_string()),
+                    sha512: None,
+                }],
+                extra: BTreeMap::new(),
+            }],
+        );
+
+        let plan = build_debian_sync_plan(
+            "jammy",
+            &release,
+            &filter,
+            &packages_by_index_path,
+            &sources_by_index_path,
+            DebianSyncDownloadPolicy::Immediate,
+        );
+
+        assert_eq!(plan.source_indexes.len(), 1);
+        assert_eq!(
+            plan.missing_package_indexes,
+            vec!["main/binary-amd64/Packages.xz".to_string()]
+        );
+        assert!(plan.missing_source_indexes.is_empty());
+        assert_eq!(plan.source_files.len(), 1);
+        assert_eq!(
+            plan.source_files[0].filename,
+            "pool/main/n/nginx/nginx_1.0-1.dsc"
+        );
+        assert!(plan.source_files[0].download);
+    }
+    #[test]
     fn test_build_debian_sync_plan_marks_immediate_downloads_and_missing_indexes() {
         let release = parse_release("Suite: bookworm\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n a 1 main/binary-amd64/Packages.gz\n").unwrap();
         let filter = DebianSyncFilter {
             distributions: vec!["bookworm".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
         };
         let packages_by_index_path = BTreeMap::new();
 
@@ -2220,6 +2751,7 @@ Source: full-pkg-src
             &release,
             &filter,
             &packages_by_index_path,
+            &BTreeMap::new(),
             DebianSyncDownloadPolicy::from_label(Some("immediate")),
         );
 

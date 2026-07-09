@@ -27,7 +27,6 @@ use crate::api::extractors::Json;
 use crate::api::handlers::is_replication_request;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
-use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
@@ -382,32 +381,69 @@ pub struct ListRepositoriesQuery {
     pub q: Option<String>,
 }
 
-const DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian_config";
+const DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian";
+const LEGACY_DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian_config";
+
+/// Artifact Keeper-native Debian metadata behavior.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianMetadataStrategy {
+    /// Serve upstream Release/InRelease/Release.gpg and package indexes unchanged.
+    #[default]
+    UpstreamPassthrough,
+    /// Apply Artifact Keeper filters and generate local Packages/Release metadata.
+    FilterAndGenerate,
+    /// Filter, generate, and sign local Release metadata.
+    FilterGenerateAndSign,
+    /// Generate hosted repository metadata from stored `.deb` packages.
+    HostedGenerate,
+}
+
+impl DebianMetadataStrategy {
+    pub(crate) fn generates_metadata(self) -> bool {
+        matches!(
+            self,
+            Self::FilterAndGenerate | Self::FilterGenerateAndSign | Self::HostedGenerate
+        )
+    }
+
+    pub(crate) fn signs_metadata(self) -> bool {
+        matches!(self, Self::FilterGenerateAndSign)
+    }
+}
+
+/// Artifact Keeper-native package payload fetch behavior for Debian remotes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DebianPackageFetchStrategy {
+    /// Use Artifact Keeper's existing pull-through cache behavior.
+    #[default]
+    CacheOnRequest,
+    /// Fetch selected packages immediately after selected indexes are read.
+    PrefetchSelected,
+    /// Stream requested packages from upstream without persisting payloads.
+    Passthrough,
+}
 
 /// Debian/APT repository options exposed through repository create, update, and detail APIs.
-/// Hosted example: `{"distributions":["bookworm"],"components":["main"],"architectures":["amd64","arm64","all"],"signing_enabled":true}`.
-/// Remote proxy example: `{"distributions":["jammy"],"components":["main","universe"],"architectures":["amd64","all"],"upstream_base_url":"https://archive.ubuntu.com/ubuntu"}`.
-/// Filtered sync example: `{"sync":{"base_url":"https://archive.ubuntu.com/ubuntu","distributions":["jammy"],"components":["main"],"architectures":["amd64"],"download_policy":"on_demand"}}`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 #[schema(example = json!({
-    "distributions": ["jammy"],
-    "suite": "jammy",
-    "codename": "jammy",
-    "description": "Filtered Ubuntu Jammy mirror",
+    "distribution_paths": ["jammy", "jammy-updates"],
     "components": ["main", "universe"],
-    "architectures": ["amd64", "arm64", "all"],
-    "signing_enabled": true,
-    "upstream_base_url": "https://archive.ubuntu.com/ubuntu",
-    "sync": {
-        "base_url": "https://archive.ubuntu.com/ubuntu",
-        "distributions": ["jammy"],
-        "components": ["main"],
-        "architectures": ["amd64", "all"],
-        "cache_policy": "metadata_ttl",
-        "download_policy": "on_demand",
-        "re_sign": true
-    },
-    "upload_endpoint": "/debian/<repo-key>/pool/{component}/{path}",
+    "architectures": ["amd64"],
+    "include_source_packages": false,
+    "flat_repository": false,
+    "verify_upstream_metadata": true,
+    "upstream_gpg_key_id": "ubuntu-archive-key",
+    "metadata_strategy": "upstream_passthrough",
+    "package_fetch_strategy": "cache_on_request",
+    "ignore_missing_indexes": false,
+    "signing_key_id": null,
+    "metadata_paths": [
+        "dists/jammy/Release",
+        "dists/jammy/main/binary-amd64/Packages.gz"
+    ],
+    "upload_endpoint": "/debian/example/pool/{component}/{path}",
     "upload_path_template": "pool/{component}/{prefix}/{source-or-package}/{package}_{version}_{architecture}.deb",
     "upload_metadata_headers": [
         "X-Debian-Distribution: <distribution>",
@@ -416,100 +452,172 @@ const DEBIAN_REPOSITORY_CONFIG_KEY: &str = "debian_config";
     ]
 }))]
 pub struct DebianRepositoryConfig {
-    /// Debian distributions/codenames enabled for this repository, e.g. `jammy`, `noble`, `bookworm`.
-    #[serde(default)]
-    pub distributions: Vec<String>,
-    /// Optional Debian suite value to place in Release metadata.
-    #[serde(default)]
-    pub suite: Option<String>,
-    /// Optional Debian codename value to place in Release metadata.
-    #[serde(default)]
-    pub codename: Option<String>,
-    /// Optional Debian Release description displayed by APT clients.
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Debian components enabled for this repository, e.g. `main`, `contrib`, `non-free`, `universe`.
-    #[serde(default)]
+    /// Paths from the upstream root to Release/InRelease metadata, e.g. `jammy` or `/` for flat repos.
+    #[serde(default, alias = "distributions")]
+    pub distribution_paths: Vec<String>,
+    /// Component filters. Omitted, empty, null, or `["*"]` means all upstream components.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
     pub components: Vec<String>,
-    /// Debian architectures enabled for this repository, e.g. `amd64`, `arm64`, `all`.
-    #[serde(default)]
+    /// Architecture filters. Omitted, empty, null, or `["*"]` means all upstream architectures.
+    #[serde(default, deserialize_with = "deserialize_vec_string_or_null")]
     pub architectures: Vec<String>,
-    /// Enable Release metadata signing for InRelease and Release.gpg generation.
+    /// Include upstream source package indexes and artifacts when available.
     #[serde(default)]
-    pub signing_enabled: bool,
-    /// Existing signing key ID to use when signing is enabled.
+    pub include_source_packages: bool,
+    /// Treat the Debian repository as a flat repository without component/binary architecture paths.
+    #[serde(default)]
+    pub flat_repository: bool,
+    /// Verify upstream InRelease or Release + Release.gpg before trusting metadata.
+    #[serde(default)]
+    pub verify_upstream_metadata: bool,
+    /// Public key reference used only for upstream metadata verification.
+    #[serde(default)]
+    pub upstream_gpg_key_id: Option<String>,
+    /// Artifact Keeper metadata handling strategy.
+    #[serde(default)]
+    pub metadata_strategy: DebianMetadataStrategy,
+    /// Package payload fetch strategy for remote repositories.
+    #[serde(default)]
+    pub package_fetch_strategy: DebianPackageFetchStrategy,
+    /// Continue when safe if selected upstream index files are missing.
+    #[serde(default)]
+    pub ignore_missing_indexes: bool,
+    /// Private signing key reference used only for generated local Release metadata.
     #[serde(default)]
     pub signing_key_id: Option<Uuid>,
-    /// Upstream Debian repository URL for remote/proxy repositories.
-    #[serde(default)]
-    pub upstream_base_url: Option<String>,
-    /// Filtered mirror-sync settings for Debian remote repositories.
-    #[serde(default)]
-    pub sync: Option<DebianRepositorySyncConfig>,
+    /// UI-facing warnings derived from broad filters or risky fetch choices.
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_vec_string",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schema(read_only)]
+    pub warnings: Vec<String>,
     /// UI-facing apt source example, populated on read when enough fields are configured.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_option_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(read_only)]
     pub apt_source_example: Option<String>,
     /// UI-facing public key endpoint, populated on read when signing is enabled.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_option_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(read_only)]
     pub public_key_url: Option<String>,
     /// UI-facing metadata paths generated for configured distributions/components/architectures.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_vec_string",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schema(read_only)]
     pub metadata_paths: Vec<String>,
     /// UI-facing hosted-upload endpoint template for Debian .deb uploads.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_option_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(read_only)]
     pub upload_endpoint: Option<String>,
     /// UI-facing pool path template used for stable Debian package filenames.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_option_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(read_only)]
     pub upload_path_template: Option<String>,
     /// UI-facing request headers accepted to provide Debian upload metadata.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "ignore_deserialized_vec_string",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schema(read_only)]
     pub upload_metadata_headers: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
-#[schema(example = json!({
-    "base_url": "https://deb.debian.org/debian",
-    "distributions": ["bookworm"],
-    "components": ["main", "contrib"],
-    "architectures": ["amd64", "all"],
-    "cache_policy": "metadata_ttl",
-    "download_policy": "on_demand",
-    "re_sign": false
-}))]
-pub struct DebianRepositorySyncConfig {
-    /// Upstream base URL used by filtered Debian mirror sync.
-    #[serde(default)]
-    pub base_url: Option<String>,
-    /// Distribution filters for sync.
-    #[serde(default)]
-    pub distributions: Vec<String>,
-    /// Component filters for sync.
-    #[serde(default)]
-    pub components: Vec<String>,
-    /// Architecture filters for sync. `all` packages are included in every selected binary architecture.
-    #[serde(default)]
-    pub architectures: Vec<String>,
-    /// Optional cache policy label if the deployment exposes one.
-    #[serde(default)]
-    pub cache_policy: Option<String>,
-    /// Optional download policy label, e.g. on-demand or immediate, if supported by the deployment.
-    #[serde(default)]
-    pub download_policy: Option<String>,
-    /// Re-sign generated local metadata after filtering upstream content.
-    #[serde(default)]
-    pub re_sign: bool,
+fn ignore_deserialized_option_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(None)
+}
+
+fn ignore_deserialized_vec_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(Vec::new())
+}
+
+fn deserialize_vec_string_or_null<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl DebianRepositoryConfig {
+    pub(crate) fn signing_enabled(&self) -> bool {
+        self.metadata_strategy.signs_metadata()
+    }
+
+    pub(crate) fn generated_metadata_enabled(&self) -> bool {
+        self.metadata_strategy.generates_metadata()
+    }
+
+    pub(crate) fn component_filter_is_all(&self) -> bool {
+        filter_values_are_all(&self.components)
+    }
+
+    pub(crate) fn architecture_filter_is_all(&self) -> bool {
+        filter_values_are_all(&self.architectures)
+    }
+
+    pub(crate) fn effective_components(&self) -> Vec<String> {
+        if self.component_filter_is_all() {
+            Vec::new()
+        } else {
+            normalized_non_empty_values(&self.components)
+        }
+    }
+
+    pub(crate) fn effective_architectures(&self) -> Vec<String> {
+        if self.architecture_filter_is_all() {
+            Vec::new()
+        } else {
+            normalized_non_empty_values(&self.architectures)
+        }
+    }
+
+    pub(crate) fn effective_distribution_paths(&self) -> Vec<String> {
+        normalized_non_empty_values(&self.distribution_paths)
+    }
+
     fn hydrated_for_response(&self, repo_key: &str, upstream_url: Option<&str>) -> Self {
         let mut config = self.clone();
-        if config.upstream_base_url.is_none() {
-            config.upstream_base_url = upstream_url.map(str::to_string);
+        if config.warnings.is_empty() {
+            config.warnings = debian_config_warnings(&config);
         }
         if config.apt_source_example.is_none() {
             config.apt_source_example = build_debian_apt_source_example(repo_key, &config);
         }
-        if config.public_key_url.is_none() && debian_signing_enabled(&config) {
+        if config.public_key_url.is_none() && config.signing_enabled() {
             if let Some(distribution) = first_debian_distribution(&config) {
                 config.public_key_url = Some(format!(
                     "/debian/{repo_key}/dists/{distribution}/gpg-key.asc"
@@ -536,18 +644,56 @@ impl DebianRepositoryConfig {
                 "X-Debian-Architecture: <architecture>".to_string(),
             ];
         }
+        if config.apt_source_example.is_none() {
+            if let Some(upstream_url) = upstream_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                config.apt_source_example = Some(format!(
+                    "deb {upstream_url} {} {}",
+                    first_debian_distribution(&config).unwrap_or("stable"),
+                    first_debian_component(&config).unwrap_or("main")
+                ));
+            }
+        }
         config
     }
 }
 
+fn normalized_non_empty_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn filter_values_are_all(values: &[String]) -> bool {
+    let values = normalized_non_empty_values(values);
+    values.is_empty() || values.iter().any(|value| value == "*")
+}
+
 fn first_debian_distribution(config: &DebianRepositoryConfig) -> Option<&str> {
     config
-        .distributions
+        .distribution_paths
         .iter()
         .map(String::as_str)
-        .find(|value| !value.trim().is_empty())
-        .or(config.codename.as_deref())
-        .or(config.suite.as_deref())
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn first_debian_component(config: &DebianRepositoryConfig) -> Option<&str> {
+    if config.component_filter_is_all() {
+        None
+    } else {
+        config
+            .components
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+    }
 }
 
 fn build_debian_apt_source_example(
@@ -555,63 +701,67 @@ fn build_debian_apt_source_example(
     config: &DebianRepositoryConfig,
 ) -> Option<String> {
     let distribution = first_debian_distribution(config)?;
-    let component = config
-        .components
-        .iter()
-        .map(String::as_str)
-        .find(|value| !value.trim().is_empty())
-        .unwrap_or("main");
-    let signed_by = if config.signing_enabled {
+    let signed_by = if config.signing_enabled() {
         " [signed-by=/usr/share/keyrings/artifact-keeper.gpg]"
     } else {
         ""
     };
+    if config.flat_repository {
+        return Some(format!("deb{signed_by} <repo-url>/debian/{repo_key} ./"));
+    }
+    let component = first_debian_component(config).unwrap_or("main");
     Some(format!(
         "deb{signed_by} <repo-url>/debian/{repo_key} {distribution} {component}"
     ))
 }
 
 fn debian_config_upstream_url(
-    config: Option<&DebianRepositoryConfig>,
-    repo_type: &RepositoryType,
+    _config: Option<&DebianRepositoryConfig>,
+    _repo_type: &RepositoryType,
 ) -> Option<String> {
-    if *repo_type != RepositoryType::Remote {
-        return None;
-    }
-    let config = config?;
-    config
-        .upstream_base_url
-        .as_deref()
-        .or_else(|| {
-            config
-                .sync
-                .as_ref()
-                .and_then(|sync| sync.base_url.as_deref())
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+    // Debian remotes use the repository's top-level upstream_url. The Debian
+    // config intentionally avoids a second upstream URL so existing remote
+    // proxy/cache behavior stays Artifact Keeper-native and backwards compatible.
+    None
 }
 
 fn build_debian_metadata_paths(config: &DebianRepositoryConfig) -> Vec<String> {
     let mut paths = Vec::new();
-    for distribution in &config.distributions {
-        if distribution.trim().is_empty() {
+    let components = if config.component_filter_is_all() {
+        vec!["{component}".to_string()]
+    } else {
+        config.effective_components()
+    };
+    let architectures = if config.architecture_filter_is_all() {
+        vec!["{arch}".to_string()]
+    } else {
+        config
+            .effective_architectures()
+            .into_iter()
+            .filter(|arch| arch != "all")
+            .collect()
+    };
+
+    for distribution in config.effective_distribution_paths() {
+        let distribution = distribution.trim_end_matches('/');
+        let release_prefix = if config.flat_repository || distribution.is_empty() {
+            "".to_string()
+        } else {
+            format!("dists/{distribution}/")
+        };
+        paths.push(format!("{release_prefix}Release"));
+        if config.signing_enabled() {
+            paths.push(format!("{release_prefix}InRelease"));
+            paths.push(format!("{release_prefix}Release.gpg"));
+        }
+        if config.flat_repository {
+            paths.push("Packages".to_string());
+            paths.push("Packages.gz".to_string());
+            paths.push("Packages.xz".to_string());
             continue;
         }
-        paths.push(format!("dists/{distribution}/Release"));
-        if config.signing_enabled {
-            paths.push(format!("dists/{distribution}/InRelease"));
-            paths.push(format!("dists/{distribution}/Release.gpg"));
-        }
-        for component in &config.components {
-            if component.trim().is_empty() {
-                continue;
-            }
-            for arch in &config.architectures {
-                if arch.trim().is_empty() || arch == "all" {
-                    continue;
-                }
+        for component in &components {
+            for arch in &architectures {
                 paths.push(format!(
                     "dists/{distribution}/{component}/binary-{arch}/Packages"
                 ));
@@ -627,63 +777,30 @@ fn build_debian_metadata_paths(config: &DebianRepositoryConfig) -> Vec<String> {
     paths
 }
 
-fn validate_non_empty_debian_values(values: &[String], field: &str) -> Result<()> {
+fn validate_filter_values(values: &[String], field: &str) -> Result<()> {
     for value in values {
-        validate_debian_identifier(value, field)?;
-    }
-    Ok(())
-}
-
-fn validate_optional_debian_identifier(value: Option<&str>, field: &str) -> Result<()> {
-    if let Some(value) = value {
-        validate_debian_identifier(value, field)?;
-    }
-    Ok(())
-}
-
-fn debian_signing_enabled(config: &DebianRepositoryConfig) -> bool {
-    config.signing_enabled
-        || config
-            .sync
-            .as_ref()
-            .map(|sync| sync.re_sign)
-            .unwrap_or(false)
-}
-
-fn debian_cache_ttl_seconds(config: &DebianRepositoryConfig) -> Result<Option<i64>> {
-    let Some(label) = config
-        .sync
-        .as_ref()
-        .and_then(|sync| sync.cache_policy.as_deref())
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-    else {
-        return Ok(None);
-    };
-
-    let normalized = label.to_ascii_lowercase();
-    let ttl = match normalized.as_str() {
-        "metadata_ttl" | "default" => crate::services::proxy_service::DEFAULT_DISTS_INDEX_TTL_SECS,
-        "always_revalidate" | "no_cache" | "no-cache" => 0,
-        _ => {
-            let Some(value) = normalized.strip_prefix("ttl:") else {
-                return Err(AppError::Validation(format!(
-                    "Unsupported debian_config.sync.cache_policy '{label}'"
-                )));
-            };
-            value.parse::<i64>().map_err(|_| {
-                AppError::Validation(format!(
-                    "debian_config.sync.cache_policy '{label}' must use ttl:<seconds>"
-                ))
-            })?
+        let value = value.trim();
+        if value.is_empty() || value == "*" {
+            continue;
         }
-    };
-    if ttl < 0 {
-        return Err(AppError::Validation(
-            "debian_config.sync.cache_policy TTL must be non-negative".to_string(),
-        ));
+        validate_debian_identifier(value, field)?;
     }
-    Ok(Some(ttl))
+    Ok(())
+}
+
+fn validate_distribution_path(value: &str) -> Result<()> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 256
+        && !value.contains("..")
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control);
+    if !valid {
+        return Err(AppError::Validation(format!(
+            "debian.distribution_paths contains invalid path '{value}'"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_debian_identifier(value: &str, field: &str) -> Result<()> {
@@ -695,10 +812,26 @@ fn validate_debian_identifier(value: &str, field: &str) -> Result<()> {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+'));
     if !valid {
         return Err(AppError::Validation(format!(
-            "debian_config.{field} contains invalid Debian identifier '{value}'"
+            "debian.{field} contains invalid Debian identifier '{value}'"
         )));
     }
     Ok(())
+}
+
+fn debian_config_warnings(config: &DebianRepositoryConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if config.component_filter_is_all() {
+        warnings.push("Components are set to all. Artifact Keeper will read all components advertised by the upstream Release metadata for the selected distribution(s). This may increase metadata size, package visibility, and storage usage if package prefetching is enabled.".to_string());
+    }
+    if config.architecture_filter_is_all() {
+        warnings.push("Architectures are set to all. Artifact Keeper will read all architectures advertised by the upstream Release metadata for the selected distribution(s). This may significantly increase metadata size and package visibility. Use a specific architecture such as amd64 or arm64 to reduce scope.".to_string());
+    }
+    if config.package_fetch_strategy == DebianPackageFetchStrategy::PrefetchSelected
+        && (config.component_filter_is_all() || config.architecture_filter_is_all())
+    {
+        warnings.push("Prefetch is enabled with broad component or architecture selection. Artifact Keeper may download a large number of packages and consume significant storage. Consider using cache_on_request or narrowing the filters.".to_string());
+    }
+    warnings
 }
 
 fn validate_debian_repository_config(
@@ -710,40 +843,66 @@ fn validate_debian_repository_config(
     };
     if *format != RepositoryFormat::Debian {
         return Err(AppError::Validation(
-            "debian_config is only valid for Debian/APT repositories".to_string(),
+            "debian is only valid for Debian/APT repositories".to_string(),
         ));
     }
-    validate_non_empty_debian_values(&config.distributions, "distributions")?;
-    validate_non_empty_debian_values(&config.components, "components")?;
-    validate_non_empty_debian_values(&config.architectures, "architectures")?;
-    validate_optional_debian_identifier(config.suite.as_deref(), "suite")?;
-    validate_optional_debian_identifier(config.codename.as_deref(), "codename")?;
-    if let Some(url) = config.upstream_base_url.as_deref() {
-        validate_outbound_url(url, "Debian upstream base URL")?;
+
+    let distribution_paths = config.effective_distribution_paths();
+    if distribution_paths.is_empty() {
+        return Err(AppError::Validation(
+            "debian.distribution_paths must contain at least one value".to_string(),
+        ));
     }
-    if let Some(sync) = &config.sync {
-        validate_non_empty_debian_values(&sync.distributions, "sync.distributions")?;
-        validate_non_empty_debian_values(&sync.components, "sync.components")?;
-        validate_non_empty_debian_values(&sync.architectures, "sync.architectures")?;
-        if let Some(url) = sync.base_url.as_deref() {
-            validate_outbound_url(url, "Debian sync base URL")?;
+    for path in &distribution_paths {
+        validate_distribution_path(path)?;
+    }
+    validate_filter_values(&config.components, "components")?;
+    validate_filter_values(&config.architectures, "architectures")?;
+
+    if config.flat_repository {
+        if distribution_paths.len() != 1 {
+            return Err(AppError::Validation(
+                "debian.flat_repository=true requires exactly one distribution path".to_string(),
+            ));
         }
-        if let Some(policy) = sync.download_policy.as_deref() {
-            match policy.trim().to_ascii_lowercase().as_str() {
-                "" | "on_demand" | "on-demand" | "immediate" | "eager" | "full" | "full_mirror"
-                | "full-mirror" => {}
-                _ => {
-                    return Err(AppError::Validation(format!(
-                        "Unsupported debian_config.sync.download_policy '{policy}'"
-                    )))
-                }
-            }
+        let path = distribution_paths[0].trim();
+        if !path.ends_with('/') {
+            return Err(AppError::Validation(
+                "debian.flat_repository=true requires distribution_paths[0] to end with '/'"
+                    .to_string(),
+            ));
+        }
+        if !config.component_filter_is_all() {
+            return Err(AppError::Validation(
+                "debian.flat_repository=true requires components to be omitted, empty, or ['*']"
+                    .to_string(),
+            ));
         }
     }
-    debian_cache_ttl_seconds(config)?;
+
+    if config.metadata_strategy.signs_metadata() && config.signing_key_id.is_none() {
+        return Err(AppError::Validation(
+            "metadata_strategy=filter_generate_and_sign requires signing_key_id.".to_string(),
+        ));
+    }
+    if config.verify_upstream_metadata
+        && config
+            .upstream_gpg_key_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err(AppError::Validation(
+            "verify_upstream_metadata=true requires upstream_gpg_key_id.".to_string(),
+        ));
+    }
     Ok(())
 }
 
+fn debian_cache_ttl_seconds(_config: &DebianRepositoryConfig) -> Result<Option<i64>> {
+    Ok(None)
+}
 async fn upsert_debian_config(
     db: &sqlx::PgPool,
     repo_id: Uuid,
@@ -768,7 +927,7 @@ async fn sync_debian_signing_config(
         .update_signing_config(
             repo_id,
             signing_key_id,
-            debian_signing_enabled(config),
+            config.signing_enabled(),
             false,
             false,
         )
@@ -784,6 +943,7 @@ async fn load_debian_config(
     if response.format != "debian" {
         return None;
     }
+
     let stored = match sqlx::query_scalar::<_, String>(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
     )
@@ -792,7 +952,21 @@ async fn load_debian_config(
     .fetch_optional(db)
     .await
     {
-        Ok(stored) => stored,
+        Ok(Some(stored)) => Some(stored),
+        Ok(None) => match sqlx::query_scalar::<_, String>(
+            "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+        )
+        .bind(repo_id)
+        .bind(LEGACY_DEBIAN_REPOSITORY_CONFIG_KEY)
+        .fetch_optional(db)
+        .await
+        {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(repository_id = %repo_id, error = %e, "failed to load legacy Debian repository config");
+                None
+            }
+        },
         Err(e) => {
             tracing::warn!(repository_id = %repo_id, error = %e, "failed to load Debian repository config");
             None
@@ -809,13 +983,9 @@ async fn load_debian_config(
                 None
             }
         },
-        None => Some(
-            DebianRepositoryConfig::default()
-                .hydrated_for_response(&response.key, response.upstream_url.as_deref()),
-        ),
+        None => None,
     }
 }
-
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRepositoryRequest {
     pub key: String,
@@ -859,7 +1029,8 @@ pub struct CreateRepositoryRequest {
     /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Debian/APT repository options surfaced to UI/OpenAPI clients.
-    pub debian_config: Option<DebianRepositoryConfig>,
+    #[serde(default, alias = "debian_config")]
+    pub debian: Option<DebianRepositoryConfig>,
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
     pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
@@ -905,6 +1076,8 @@ pub struct UpdateRepositoryRequest {
     /// If both `is_public` and `allow_anonymous_access` are provided,
     /// `allow_anonymous_access` takes precedence.
     pub allow_anonymous_access: Option<bool>,
+    /// Update the remote upstream URL. When omitted, the existing value is preserved.
+    pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
     /// When provided, enables/disables the `promotion_only` policy for this
     /// repository (admin-only). When omitted, the flag is left unchanged.
@@ -918,7 +1091,8 @@ pub struct UpdateRepositoryRequest {
     /// Only meaningful for PyPI / Poetry / Conda Remote repositories.
     pub pypi_upstream_index_path: Option<String>,
     /// Debian/APT repository options surfaced to UI/OpenAPI clients.
-    pub debian_config: Option<DebianRepositoryConfig>,
+    #[serde(default, alias = "debian_config")]
+    pub debian: Option<DebianRepositoryConfig>,
     /// Enable or disable quarantine period for this repository.
     /// When enabled, newly uploaded artifacts are held until scanned.
     /// Stored in `repository_config` under `quarantine_enabled`.
@@ -973,7 +1147,7 @@ pub struct RepositoryResponse {
     pub quarantine_duration_minutes: Option<i64>,
     /// Debian/APT repository options read from repository_config.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub debian_config: Option<DebianRepositoryConfig>,
+    pub debian: Option<DebianRepositoryConfig>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1009,7 +1183,7 @@ fn repo_to_response(
         // db-less, mirroring `upstream_auth_*` above (#1770 B).
         quarantine_enabled: None,
         quarantine_duration_minutes: None,
-        debian_config: None,
+        debian: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -1025,7 +1199,7 @@ async fn with_quarantine_settings(
     let (enabled, duration) = crate::services::quarantine_service::repo_settings(db, repo_id).await;
     response.quarantine_enabled = enabled;
     response.quarantine_duration_minutes = duration;
-    response.debian_config = load_debian_config(db, repo_id, &response).await;
+    response.debian = load_debian_config(db, repo_id, &response).await;
     response
 }
 
@@ -1716,13 +1890,14 @@ pub async fn list_repositories(
         std::collections::HashMap::new()
     };
 
-    let items: Vec<RepositoryResponse> = repos
-        .into_iter()
-        .map(|r| {
-            let storage = storage_map.get(&r.id).copied().unwrap_or(0);
-            repo_to_response(r, storage)
-        })
-        .collect();
+    let mut items: Vec<RepositoryResponse> = Vec::with_capacity(repos.len());
+    for repo in repos {
+        let repo_id = repo.id;
+        let storage = storage_map.get(&repo_id).copied().unwrap_or(0);
+        let mut response = repo_to_response(repo, storage);
+        response.debian = load_debian_config(&state.db, repo_id, &response).await;
+        items.push(response);
+    }
 
     Ok(Json(RepositoryListResponse {
         items,
@@ -1793,7 +1968,7 @@ pub async fn create_repository(
     let service = state.create_repository_service();
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
-    let debian_config = payload.debian_config.clone();
+    let debian_config = payload.debian.clone();
     let debian_upstream_url = debian_config_upstream_url(debian_config.as_ref(), &repo_type);
     validate_debian_repository_config(&format, debian_config.as_ref())?;
 
@@ -1947,7 +2122,7 @@ pub async fn create_repository(
         response.upstream_auth_configured = true;
     }
     if let Some(config) = debian_config {
-        response.debian_config =
+        response.debian =
             Some(config.hydrated_for_response(&response.key, response.upstream_url.as_deref()));
     }
     Ok(Json(response))
@@ -2033,7 +2208,7 @@ pub async fn update_repository(
 
     // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
-    let debian_config = payload.debian_config.clone();
+    let debian_config = payload.debian.clone();
     let debian_upstream_url =
         debian_config_upstream_url(debian_config.as_ref(), &existing.repo_type);
     validate_debian_repository_config(&existing.format, debian_config.as_ref())?;
@@ -2075,7 +2250,7 @@ pub async fn update_repository(
                 description: payload.description,
                 is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
-                upstream_url: debian_upstream_url,
+                upstream_url: payload.upstream_url.or(debian_upstream_url),
                 promotion_only: payload.promotion_only,
             },
         )
@@ -5953,7 +6128,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryListResponse,
         DebianRepositoryConfig,
-        DebianRepositorySyncConfig,
+        DebianMetadataStrategy,
+        DebianPackageFetchStrategy,
         SetCacheTtlRequest,
         CacheTtlResponse,
         InvalidateCacheQuery,
@@ -7194,35 +7370,78 @@ mod tests {
             "format": "debian",
             "repo_type": "remote",
             "upstream_url": "https://archive.ubuntu.com/ubuntu",
-            "debian_config": {
-                "distributions": ["jammy", "noble"],
+            "debian": {
+                "distribution_paths": ["jammy", "jammy-updates"],
                 "components": ["main", "universe"],
-                "architectures": ["amd64", "arm64", "all"],
-                "signing_enabled": true,
-                "sync": {
-                    "base_url": "https://archive.ubuntu.com/ubuntu",
-                    "distributions": ["jammy"],
-                    "components": ["main"],
-                    "architectures": ["amd64"],
-                    "download_policy": "on_demand"
-                }
+                "architectures": ["amd64"],
+                "include_source_packages": false,
+                "flat_repository": false,
+                "metadata_strategy": "filter_and_generate",
+                "package_fetch_strategy": "cache_on_request",
+                "ignore_missing_indexes": false
             }
         }"#;
         let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
-        let config = req.debian_config.unwrap();
-        assert_eq!(config.distributions, vec!["jammy", "noble"]);
+        let config = req.debian.unwrap();
+        assert_eq!(config.distribution_paths, vec!["jammy", "jammy-updates"]);
         assert_eq!(config.components, vec!["main", "universe"]);
-        assert!(config.signing_enabled);
+        assert_eq!(config.architectures, vec!["amd64"]);
         assert_eq!(
-            config.sync.unwrap().base_url.as_deref(),
-            Some("https://archive.ubuntu.com/ubuntu")
+            config.metadata_strategy,
+            DebianMetadataStrategy::FilterAndGenerate
         );
+        assert_eq!(
+            config.package_fetch_strategy,
+            DebianPackageFetchStrategy::CacheOnRequest
+        );
+    }
+
+    #[test]
+    fn test_create_repository_request_accepts_null_debian_filters_as_all() {
+        let json = r#"{
+            "key": "ubuntu-proxy",
+            "name": "Ubuntu Proxy",
+            "format": "debian",
+            "repo_type": "remote",
+            "upstream_url": "https://archive.ubuntu.com/ubuntu",
+            "debian": {
+                "distribution_paths": ["jammy"],
+                "components": null,
+                "architectures": null
+            }
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        let config = req.debian.unwrap();
+        assert!(config.components.is_empty());
+        assert!(config.architectures.is_empty());
+        assert!(config.component_filter_is_all());
+        assert!(config.architecture_filter_is_all());
+    }
+    #[test]
+    fn test_create_repository_request_accepts_legacy_debian_config_alias() {
+        let json = r#"{
+            "key": "ubuntu-proxy",
+            "name": "Ubuntu Proxy",
+            "format": "debian",
+            "repo_type": "remote",
+            "upstream_url": "https://archive.ubuntu.com/ubuntu",
+            "debian_config": {
+                "distributions": ["jammy"],
+                "components": ["*"],
+                "architectures": []
+            }
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        let config = req.debian.unwrap();
+        assert_eq!(config.distribution_paths, vec!["jammy"]);
+        assert!(config.component_filter_is_all());
+        assert!(config.architecture_filter_is_all());
     }
 
     #[test]
     fn test_debian_config_rejects_unsafe_identifiers() {
         let mut config = DebianRepositoryConfig {
-            distributions: vec!["bookworm\nSHA256:".to_string()],
+            distribution_paths: vec!["bookworm\nSHA256:".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             ..Default::default()
@@ -7231,7 +7450,7 @@ mod tests {
             validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_err()
         );
 
-        config.distributions = vec!["bookworm".to_string()];
+        config.distribution_paths = vec!["bookworm".to_string()];
         config.components = vec!["../main".to_string()];
         assert!(
             validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_err()
@@ -7241,13 +7460,14 @@ mod tests {
     #[test]
     fn test_debian_derived_response_fields_are_not_accepted_as_input() {
         let config: DebianRepositoryConfig = serde_json::from_value(serde_json::json!({
-            "distributions": ["bookworm"],
+            "distribution_paths": ["bookworm"],
             "apt_source_example": "attacker supplied",
             "public_key_url": "/wrong",
             "metadata_paths": ["wrong"],
             "upload_endpoint": "/wrong",
             "upload_path_template": "wrong",
-            "upload_metadata_headers": ["wrong"]
+            "upload_metadata_headers": ["wrong"],
+            "warnings": ["wrong"]
         }))
         .unwrap();
         assert!(config.apt_source_example.is_none());
@@ -7256,36 +7476,91 @@ mod tests {
         assert!(config.upload_endpoint.is_none());
         assert!(config.upload_path_template.is_none());
         assert!(config.upload_metadata_headers.is_empty());
+        assert!(config.warnings.is_empty());
     }
 
     #[test]
-    fn test_debian_sync_policy_wires_cache_and_resigning() {
-        let config = DebianRepositoryConfig {
-            sync: Some(DebianRepositorySyncConfig {
-                cache_policy: Some("ttl:45".to_string()),
-                re_sign: true,
-                ..Default::default()
-            }),
+    fn test_debian_strategy_validation_requires_keys() {
+        let mut config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            metadata_strategy: DebianMetadataStrategy::FilterGenerateAndSign,
             ..Default::default()
         };
-        assert_eq!(debian_cache_ttl_seconds(&config).unwrap(), Some(45));
-        assert!(debian_signing_enabled(&config));
+        let err = validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config))
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert_eq!(
+                msg,
+                "metadata_strategy=filter_generate_and_sign requires signing_key_id."
+            ),
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        config.metadata_strategy = DebianMetadataStrategy::UpstreamPassthrough;
+        config.verify_upstream_metadata = true;
+        let err = validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config))
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert_eq!(
+                msg,
+                "verify_upstream_metadata=true requires upstream_gpg_key_id."
+            ),
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_debian_flat_repository_validation() {
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["/".to_string()],
+            flat_repository: true,
+            components: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_ok()
+        );
+
+        let invalid = DebianRepositoryConfig {
+            distribution_paths: vec!["flat".to_string()],
+            flat_repository: true,
+            components: vec!["main".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            validate_debian_repository_config(&RepositoryFormat::Debian, Some(&invalid)).is_err()
+        );
     }
 
     #[test]
     fn test_update_repository_request_with_debian_config() {
         let json = r#"{
-            "debian_config": {
-                "distributions": ["bookworm"],
+            "debian": {
+                "distribution_paths": ["bookworm"],
                 "components": ["main"],
                 "architectures": ["amd64", "all"],
-                "signing_enabled": false
+                "package_fetch_strategy": "prefetch_selected"
             }
         }"#;
         let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
-        let config = req.debian_config.unwrap();
-        assert_eq!(config.distributions, vec!["bookworm"]);
+        let config = req.debian.unwrap();
+        assert_eq!(config.distribution_paths, vec!["bookworm"]);
         assert_eq!(config.architectures, vec!["amd64", "all"]);
+        assert_eq!(
+            config.package_fetch_strategy,
+            DebianPackageFetchStrategy::PrefetchSelected
+        );
+    }
+
+    #[test]
+    fn test_update_repository_request_accepts_upstream_url_without_debian_config() {
+        let json = r#"{"upstream_url":"https://deb.debian.org/debian"}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.upstream_url.as_deref(),
+            Some("https://deb.debian.org/debian")
+        );
+        assert!(req.debian.is_none());
     }
 
     #[test]
@@ -7293,17 +7568,15 @@ mod tests {
         let spec = <RepositoriesApiDoc as utoipa::OpenApi>::openapi();
         let schemas = &spec.components.as_ref().unwrap().schemas;
         assert!(schemas.contains_key("DebianRepositoryConfig"));
-        assert!(schemas.contains_key("DebianRepositorySyncConfig"));
+        assert!(schemas.contains_key("DebianMetadataStrategy"));
+        assert!(schemas.contains_key("DebianPackageFetchStrategy"));
 
         let spec_json = serde_json::to_string(&spec).unwrap();
-        let description = ["Filtered Ubuntu ", "Jammy mirror"].concat();
-        let ubuntu_url = ["https://archive.", "ubuntu.com/ubuntu"].concat();
-        let debian_url = ["https://deb.", "debian.org/debian"].concat();
-        assert!(spec_json.contains(&description));
-        assert!(spec_json.contains(&ubuntu_url));
-        assert!(spec_json.contains(&debian_url));
-        assert!(spec_json.contains("download_policy"));
-        assert!(spec_json.contains("re_sign"));
+        assert!(spec_json.contains("distribution_paths"));
+        assert!(spec_json.contains("metadata_strategy"));
+        assert!(spec_json.contains("package_fetch_strategy"));
+        assert!(spec_json.contains("upstream_passthrough"));
+        assert!(spec_json.contains("cache_on_request"));
         assert!(spec_json.contains("upload_endpoint"));
         assert!(spec_json.contains("upload_path_template"));
         assert!(spec_json.contains("X-Debian-Distribution"));
@@ -7312,20 +7585,18 @@ mod tests {
 
     #[test]
     fn test_debian_config_hydrates_ui_fields() {
+        let signing_key_id = Uuid::new_v4();
         let config = DebianRepositoryConfig {
-            distributions: vec!["jammy".to_string()],
+            distribution_paths: vec!["jammy".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string(), "all".to_string()],
-            signing_enabled: true,
+            metadata_strategy: DebianMetadataStrategy::FilterGenerateAndSign,
+            signing_key_id: Some(signing_key_id),
             ..Default::default()
         };
 
         let hydrated =
             config.hydrated_for_response("ubuntu", Some("https://archive.ubuntu.com/ubuntu"));
-        assert_eq!(
-            hydrated.upstream_base_url.as_deref(),
-            Some("https://archive.ubuntu.com/ubuntu")
-        );
         assert_eq!(
             hydrated.apt_source_example.as_deref(),
             Some("deb [signed-by=/usr/share/keyrings/artifact-keeper.gpg] <repo-url>/debian/ubuntu jammy main")
@@ -7361,38 +7632,33 @@ mod tests {
     }
 
     #[test]
-    fn test_debian_config_upstream_url_only_for_remote_repositories() {
+    fn test_debian_config_warnings_for_all_filters_and_prefetch() {
         let config = DebianRepositoryConfig {
-            upstream_base_url: Some(" https://archive.ubuntu.com/ubuntu ".to_string()),
+            distribution_paths: vec!["jammy".to_string()],
+            components: vec!["*".to_string()],
+            architectures: Vec::new(),
+            package_fetch_strategy: DebianPackageFetchStrategy::PrefetchSelected,
             ..Default::default()
         };
+        let warnings = debian_config_warnings(&config);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].starts_with("Components are set to all."));
+        assert!(warnings[1].starts_with("Architectures are set to all."));
+        assert!(warnings[2].starts_with("Prefetch is enabled with broad component"));
+    }
 
+    #[test]
+    fn test_debian_config_does_not_override_top_level_upstream_url() {
+        let config = DebianRepositoryConfig::default();
         assert_eq!(
-            debian_config_upstream_url(Some(&config), &RepositoryType::Remote).as_deref(),
-            Some("https://archive.ubuntu.com/ubuntu")
+            debian_config_upstream_url(Some(&config), &RepositoryType::Remote),
+            None
         );
         assert_eq!(
             debian_config_upstream_url(Some(&config), &RepositoryType::Local),
             None
         );
     }
-
-    #[test]
-    fn test_debian_config_upstream_url_falls_back_to_sync_base_url() {
-        let config = DebianRepositoryConfig {
-            sync: Some(DebianRepositorySyncConfig {
-                base_url: Some("https://deb.debian.org/debian".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            debian_config_upstream_url(Some(&config), &RepositoryType::Remote).as_deref(),
-            Some("https://deb.debian.org/debian")
-        );
-    }
-
     #[test]
     fn test_debian_config_save_wires_existing_signing_config() {
         let source = include_str!("repositories.rs");
@@ -7406,7 +7672,7 @@ mod tests {
         let helper_body = &source[helper_start..helper_end];
         assert!(helper_body.contains("SigningService::new("));
         assert!(helper_body.contains(".update_signing_config("));
-        assert!(helper_body.contains("debian_signing_enabled(config)"));
+        assert!(helper_body.contains("config.signing_enabled()"));
         assert!(helper_body.contains("config.signing_key_id.or(existing_key)"));
 
         for handler in ["create_repository", "update_repository"] {
@@ -7422,6 +7688,22 @@ mod tests {
                 "{handler} must persist Debian signing settings through SigningService"
             );
         }
+    }
+
+    #[test]
+    fn test_list_repositories_hydrates_debian_config() {
+        let source = include_str!("repositories.rs");
+        let marker = "pub async fn list_repositories(";
+        let start = source.find(marker).expect("list_repositories not found");
+        let end = source[start..]
+            .find("\n/// Create a new repository")
+            .map(|offset| start + offset)
+            .expect("list_repositories end not found");
+        let body = &source[start..end];
+        assert!(
+            body.contains("load_debian_config(&state.db, repo_id, &response).await"),
+            "repository list responses must hydrate Debian config so edit/settings UI does not appear to lose saved fields"
+        );
     }
 
     #[test]
@@ -7470,7 +7752,7 @@ mod tests {
             upstream_url: None,
             upstream_auth_type: None,
             upstream_auth_configured: false,
-            debian_config: None,
+            debian: None,
             quarantine_enabled: None,
             quarantine_duration_minutes: None,
             created_at: chrono::Utc::now(),
@@ -8751,7 +9033,7 @@ mod tests {
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             upstream_auth_type: None,
             upstream_auth_configured: false,
-            debian_config: None,
+            debian: None,
             quarantine_enabled: Some(true),
             quarantine_duration_minutes: Some(525600),
             created_at: chrono::Utc::now(),
