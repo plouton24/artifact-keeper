@@ -40,9 +40,10 @@ use crate::api::handlers::repositories::DebianRepositoryConfig;
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::formats::debian::{
-    build_debian_sync_plan, filter_release_package_indexes, generate_release, parse_packages_index,
-    parse_release, DebControl, DebianHandler, DebianSyncDownloadPolicy, DebianSyncFilter,
-    DebianSyncPlan,
+    build_debian_sync_plan, filter_release_package_indexes, filter_release_source_indexes,
+    parse_packages_index, parse_release, parse_sources_index, validate_release_filter_selection,
+    DebControl, DebianHandler, DebianSyncDownloadPolicy, DebianSyncFilter, DebianSyncPlan,
+    PackagesEntry, SourceFileEntry, SourcesEntry,
 };
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::signing_key::SigningKey;
@@ -60,6 +61,17 @@ const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package"
 
 pub fn router() -> Router<SharedState> {
     Router::new()
+        // Flat repository Release files
+        .route("/:repo_key/Release", get(flat_release_file))
+        .route("/:repo_key/InRelease", get(flat_in_release_file))
+        .route("/:repo_key/Release.gpg", get(flat_release_gpg))
+        // Flat repository package/source indexes
+        .route("/:repo_key/Packages", get(flat_packages_index))
+        .route("/:repo_key/Packages.gz", get(flat_packages_index_gz))
+        .route("/:repo_key/Packages.xz", get(flat_packages_index_xz))
+        .route("/:repo_key/Sources", get(flat_sources_index))
+        .route("/:repo_key/Sources.gz", get(flat_sources_index_gz))
+        .route("/:repo_key/Sources.xz", get(flat_sources_index_xz))
         // Release files
         .route("/:repo_key/dists/:distribution/Release", get(release_file))
         .route(
@@ -163,8 +175,77 @@ fn build_packages_text(entries: &[PackageEntry]) -> String {
     text
 }
 
+fn build_generated_packages_text(
+    entries: &[PackagesEntry],
+    index_architecture: &str,
+    selected_architectures: &[String],
+) -> String {
+    let mut text = String::new();
+    let mut first = true;
+    for entry in entries.iter().filter(|entry| {
+        package_matches_generated_index(
+            &entry.control.architecture,
+            index_architecture,
+            selected_architectures,
+        )
+    }) {
+        if !first {
+            text.push('\n');
+        }
+        first = false;
+        push_generated_packages_entry(&mut text, entry);
+    }
+    text
+}
+
+fn package_matches_generated_index(
+    package_architecture: &str,
+    index_architecture: &str,
+    selected_architectures: &[String],
+) -> bool {
+    if index_architecture.is_empty() {
+        package_architecture == "all"
+            || selected_architectures.is_empty()
+            || selected_architectures
+                .iter()
+                .any(|architecture| architecture == package_architecture)
+    } else {
+        package_matches_requested_arch(package_architecture, index_architecture)
+    }
+}
 fn push_packages_entry(text: &mut String, entry: &PackageEntry) {
-    let control = &entry.control;
+    push_packages_fields(
+        text,
+        &entry.control,
+        Some(entry.filename.as_str()),
+        Some(entry.size.max(0) as u64),
+        entry.md5.as_deref(),
+        entry.sha1.as_deref(),
+        Some(entry.sha256.as_str()),
+    );
+}
+
+fn push_generated_packages_entry(text: &mut String, entry: &PackagesEntry) {
+    push_packages_fields(
+        text,
+        &entry.control,
+        entry.filename.as_deref(),
+        entry.size,
+        entry.md5sum.as_deref(),
+        entry.sha1.as_deref(),
+        entry.sha256.as_deref(),
+    );
+}
+
+fn push_packages_fields(
+    text: &mut String,
+    control: &DebControl,
+    filename: Option<&str>,
+    size: Option<u64>,
+    md5sum: Option<&str>,
+    sha1: Option<&str>,
+    sha256: Option<&str>,
+) {
     push_control_field(text, "Package", &control.package);
     push_control_field(text, "Version", &control.version);
     push_control_field(text, "Architecture", &control.architecture);
@@ -191,11 +272,13 @@ fn push_packages_entry(text: &mut String, entry: &PackageEntry) {
     }
 
     push_optional_control_field(text, "Description", control.description.as_deref());
-    push_control_field(text, "Filename", &entry.filename);
-    push_control_field(text, "Size", &entry.size.to_string());
-    push_optional_control_field(text, "MD5sum", entry.md5.as_deref());
-    push_optional_control_field(text, "SHA1", entry.sha1.as_deref());
-    push_control_field(text, "SHA256", &entry.sha256);
+    push_optional_control_field(text, "Filename", filename);
+    if let Some(size) = size {
+        push_control_field(text, "Size", &size.to_string());
+    }
+    push_optional_control_field(text, "MD5sum", md5sum);
+    push_optional_control_field(text, "SHA1", sha1);
+    push_optional_control_field(text, "SHA256", sha256);
 }
 
 fn push_optional_control_field(text: &mut String, key: &str, value: Option<&str>) {
@@ -230,6 +313,66 @@ fn push_control_field(text: &mut String, key: &str, value: &str) {
     }
 }
 
+fn build_generated_sources_text(entries: &[SourcesEntry]) -> String {
+    let mut text = String::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            text.push('\n');
+        }
+        push_sources_entry(&mut text, entry);
+    }
+    text
+}
+
+fn push_sources_entry(text: &mut String, entry: &SourcesEntry) {
+    push_control_field(text, "Package", &entry.package);
+    push_control_field(text, "Version", &entry.version);
+    push_control_field(text, "Directory", &entry.directory);
+
+    for (key, value) in &entry.extra {
+        push_control_field(text, key, value);
+    }
+
+    push_source_hash_section(text, "Files", &entry.files, source_file_md5);
+    push_source_hash_section(text, "Checksums-Sha1", &entry.files, source_file_sha1);
+    push_source_hash_section(text, "Checksums-Sha256", &entry.files, source_file_sha256);
+    push_source_hash_section(text, "Checksums-Sha512", &entry.files, source_file_sha512);
+}
+
+fn source_file_md5(file: &SourceFileEntry) -> Option<&str> {
+    file.md5sum.as_deref()
+}
+
+fn source_file_sha1(file: &SourceFileEntry) -> Option<&str> {
+    file.sha1.as_deref()
+}
+
+fn source_file_sha256(file: &SourceFileEntry) -> Option<&str> {
+    file.sha256.as_deref()
+}
+
+fn source_file_sha512(file: &SourceFileEntry) -> Option<&str> {
+    file.sha512.as_deref()
+}
+
+fn push_source_hash_section(
+    text: &mut String,
+    field: &str,
+    files: &[SourceFileEntry],
+    hash: fn(&SourceFileEntry) -> Option<&str>,
+) {
+    if !files.iter().any(|file| hash(file).is_some()) {
+        return;
+    }
+
+    text.push_str(field);
+    text.push_str(":\n");
+    for file in files {
+        if let Some(hash) = hash(file) {
+            text.push_str(&format!(" {} {} {}\n", hash, file.size, file.filename));
+        }
+    }
+}
 fn json_string<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     metadata.get(key).and_then(|v| v.as_str())
 }
@@ -385,7 +528,7 @@ async fn load_debian_repository_config(
     repo_id: uuid::Uuid,
 ) -> Option<DebianRepositoryConfig> {
     let stored = match sqlx::query_scalar::<_, String>(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'debian_config'",
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key IN ('debian', 'debian_config') ORDER BY CASE WHEN key = 'debian' THEN 0 ELSE 1 END LIMIT 1",
     )
     .bind(repo_id)
     .fetch_optional(db)
@@ -407,14 +550,6 @@ async fn load_debian_repository_config(
     }
 }
 
-fn configured_or_fallback<'a>(configured: &'a [String], fallback: &'a [String]) -> &'a [String] {
-    if configured.is_empty() {
-        fallback
-    } else {
-        configured
-    }
-}
-
 fn sync_value_allowed(values: &[String], requested: &str) -> bool {
     values.is_empty() || values.iter().any(|value| value == requested)
 }
@@ -424,21 +559,22 @@ fn debian_sync_path_allowed(
     distribution: &str,
     suffix: &str,
 ) -> bool {
-    let Some(sync) = config.sync.as_ref() else {
-        return true;
-    };
-    let distributions = configured_or_fallback(&sync.distributions, &config.distributions);
-    if !sync_value_allowed(distributions, distribution) {
+    if config.flat_repository {
+        return distribution.is_empty() || distribution == "/";
+    }
+
+    let distribution_paths = config.effective_distribution_paths();
+    if !sync_value_allowed(&distribution_paths, distribution) {
         return false;
     }
 
     let segments: Vec<&str> = suffix.split('/').collect();
     if segments.len() >= 2 && segments[1].starts_with("binary-") {
-        let components = configured_or_fallback(&sync.components, &config.components);
-        let architectures = configured_or_fallback(&sync.architectures, &config.architectures);
+        let components = config.effective_components();
+        let architectures = config.effective_architectures();
         let architecture = segments[1].strip_prefix("binary-").unwrap_or(segments[1]);
-        return sync_value_allowed(components, segments[0])
-            && sync_value_allowed(architectures, architecture);
+        return sync_value_allowed(&components, segments[0])
+            && sync_value_allowed(&architectures, architecture);
     }
     true
 }
@@ -451,11 +587,7 @@ async fn require_debian_sync_path_allowed(
 ) -> Result<(), Response> {
     if let Some(config) = load_debian_repository_config(db, repo_id).await {
         if !debian_sync_path_allowed(&config, distribution, suffix) {
-            return Err((
-                StatusCode::NOT_FOUND,
-                "Path excluded by Debian sync filters",
-            )
-                .into_response());
+            return Err((StatusCode::NOT_FOUND, "Path excluded by Debian filters").into_response());
         }
     }
     Ok(())
@@ -465,7 +597,7 @@ fn configured_release_values(values: &[String], include_arch_all: bool) -> BTree
     values
         .iter()
         .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && *value != "*")
         .filter(|value| include_arch_all || *value != "all")
         .map(str::to_string)
         .collect()
@@ -477,10 +609,10 @@ fn effective_release_layout(
     discovered_architectures: BTreeSet<String>,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
     let configured_components = config
-        .map(|config| configured_release_values(&config.components, true))
+        .map(|config| configured_release_values(&config.effective_components(), true))
         .unwrap_or_default();
     let configured_architectures = config
-        .map(|config| configured_release_values(&config.architectures, false))
+        .map(|config| configured_release_values(&config.effective_architectures(), false))
         .unwrap_or_default();
 
     let components = if configured_components.is_empty() {
@@ -496,23 +628,45 @@ fn effective_release_layout(
 
     (components, architectures)
 }
+fn build_release_content_from_files(
+    suite: &str,
+    codename: Option<&str>,
+    description: Option<&str>,
+    components: &BTreeSet<String>,
+    architectures: &BTreeSet<String>,
+    mut release_files: Vec<(String, Vec<u8>)>,
+) -> String {
+    release_files.sort_by(|left, right| left.0.cmp(&right.0));
 
-fn release_config_value(value: Option<&String>, fallback: &str) -> String {
-    value
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback)
-        .to_string()
+    let component_str = components.iter().cloned().collect::<Vec<_>>().join(" ");
+    let arch_str = architectures.iter().cloned().collect::<Vec<_>>().join(" ");
+    let now = chrono::Utc::now();
+    let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
+
+    let mut release = String::new();
+    release.push_str("Origin: artifact-keeper\n");
+    release.push_str("Label: artifact-keeper\n");
+    release.push_str(&format!("Suite: {}\n", suite));
+    if let Some(codename) = codename.filter(|value| !value.trim().is_empty()) {
+        release.push_str(&format!("Codename: {}\n", codename));
+    }
+    release.push_str(&format!("Date: {}\n", date_str));
+    release.push_str(&format!("Architectures: {}\n", arch_str));
+    release.push_str(&format!("Components: {}\n", component_str));
+    push_optional_control_field(&mut release, "Description", description);
+    push_release_hash_section(&mut release, "MD5Sum", &release_files, |bytes| {
+        ArtifactService::calculate_md5(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA1", &release_files, |bytes| {
+        ArtifactService::calculate_sha1(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA256", &release_files, |bytes| {
+        ArtifactService::calculate_sha256(bytes)
+    });
+    push_release_hash_section(&mut release, "SHA512", &release_files, calculate_sha512_hex);
+
+    release
 }
-
-fn release_config_description(config: Option<&DebianRepositoryConfig>) -> Option<&str> {
-    config
-        .and_then(|config| config.description.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 async fn generate_release_content(
     state: &SharedState,
     repo_id: uuid::Uuid,
@@ -522,17 +676,6 @@ async fn generate_release_content(
     let (components, architectures) = discover_release_layout(&state.db, repo_id).await?;
     let (components, architectures) =
         effective_release_layout(config.as_ref(), components, architectures);
-    let suite = release_config_value(
-        config.as_ref().and_then(|config| config.suite.as_ref()),
-        distribution,
-    );
-    let codename = release_config_value(
-        config.as_ref().and_then(|config| config.codename.as_ref()),
-        distribution,
-    );
-    let description = release_config_description(config.as_ref());
-    let component_str = components.iter().cloned().collect::<Vec<_>>().join(" ");
-    let arch_str = architectures.iter().cloned().collect::<Vec<_>>().join(" ");
 
     let mut release_files = Vec::new();
     for component in &components {
@@ -570,30 +713,14 @@ async fn generate_release_content(
         }
     }
 
-    let now = chrono::Utc::now();
-    let date_str = now.format("%a, %d %b %Y %H:%M:%S UTC").to_string();
-
-    let mut release = String::new();
-    release.push_str("Origin: artifact-keeper\n");
-    release.push_str("Label: artifact-keeper\n");
-    release.push_str(&format!("Suite: {}\n", suite));
-    release.push_str(&format!("Codename: {}\n", codename));
-    release.push_str(&format!("Date: {}\n", date_str));
-    release.push_str(&format!("Architectures: {}\n", arch_str));
-    release.push_str(&format!("Components: {}\n", component_str));
-    push_optional_control_field(&mut release, "Description", description);
-    push_release_hash_section(&mut release, "MD5Sum", &release_files, |bytes| {
-        ArtifactService::calculate_md5(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA1", &release_files, |bytes| {
-        ArtifactService::calculate_sha1(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA256", &release_files, |bytes| {
-        ArtifactService::calculate_sha256(bytes)
-    });
-    push_release_hash_section(&mut release, "SHA512", &release_files, calculate_sha512_hex);
-
-    Ok(release)
+    Ok(build_release_content_from_files(
+        distribution,
+        Some(distribution),
+        None,
+        &components,
+        &architectures,
+        release_files,
+    ))
 }
 
 async fn discover_release_layout(
@@ -699,6 +826,13 @@ struct DebianProxy<'a> {
     distribution: &'a str,
 }
 
+fn debian_dists_upstream_path(distribution: &str, suffix: &str) -> String {
+    if distribution.is_empty() {
+        suffix.to_string()
+    } else {
+        format!("dists/{distribution}/{suffix}")
+    }
+}
 impl<'a> DebianProxy<'a> {
     async fn resolve(
         state: &'a SharedState,
@@ -730,7 +864,7 @@ impl<'a> DebianProxy<'a> {
         // their dists metadata locally, handled by the caller's
         // post-`dists()` fallthrough, so we only need to handle Remote.
         if repo.repo_type == RepositoryType::Virtual {
-            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            let upstream_path = debian_dists_upstream_path(self.distribution, suffix);
             if let Some(resp) = try_virtual_dists(
                 self.state,
                 repo.id,
@@ -753,7 +887,7 @@ impl<'a> DebianProxy<'a> {
             (Some(u), Some(p)) => (u, p),
             _ => return Ok(()),
         };
-        let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+        let upstream_path = debian_dists_upstream_path(self.distribution, suffix);
 
         // Epoch-based lazy invalidation: if the cached file is older
         // than the release epoch, invalidate it so the streaming fetch
@@ -785,7 +919,7 @@ impl<'a> DebianProxy<'a> {
         content_type: &'static str,
         repo: &RepoInfo,
     ) -> Result<(), Response> {
-        let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+        let upstream_path = debian_dists_upstream_path(self.distribution, suffix);
         require_debian_sync_path_allowed(&self.state.db, repo.id, self.distribution, suffix)
             .await?;
 
@@ -1177,12 +1311,7 @@ async fn load_synced_release_content(
     let Some(config) = load_debian_repository_config(&state.db, repo_id).await else {
         return Ok(None);
     };
-    if !config
-        .sync
-        .as_ref()
-        .map(|sync| sync.re_sign)
-        .unwrap_or(false)
-    {
+    if !config.generated_metadata_enabled() {
         return Ok(None);
     }
 
@@ -1219,6 +1348,193 @@ async fn store_synced_release_content(
     Ok(())
 }
 
+fn canonical_plain_dists_index_path(path: &str) -> &str {
+    path.strip_suffix(".gz")
+        .or_else(|| path.strip_suffix(".xz"))
+        .unwrap_or(path)
+}
+
+fn synced_dists_key_prefix(distribution: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(distribution.as_bytes());
+    format!("debian_synced_dists:{}:", hex::encode(digest.finalize()))
+}
+
+fn synced_dists_config_key(distribution: &str, path: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(canonical_plain_dists_index_path(path).as_bytes());
+    format!(
+        "{}{}",
+        synced_dists_key_prefix(distribution),
+        hex::encode(digest.finalize())
+    )
+}
+
+async fn load_synced_dists_content(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+    path: &str,
+) -> Result<Option<String>, Response> {
+    let Some(config) = load_debian_repository_config(&state.db, repo_id).await else {
+        return Ok(None);
+    };
+    if !config.generated_metadata_enabled() {
+        return Ok(None);
+    }
+
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(synced_dists_config_key(distribution, path))
+    .fetch_optional(&state.db)
+    .await
+    .map_err(crate::api::handlers::db_err)
+}
+
+async fn clear_synced_dists_content(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+) -> Result<(), Response> {
+    sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key LIKE $2")
+        .bind(repo_id)
+        .bind(format!("{}%", synced_dists_key_prefix(distribution)))
+        .execute(db)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+    Ok(())
+}
+
+async fn store_synced_dists_content(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+    path: &str,
+    content: &str,
+) -> Result<(), Response> {
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        "#,
+    )
+    .bind(repo_id)
+    .bind(synced_dists_config_key(distribution, path))
+    .bind(content)
+    .execute(db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+    Ok(())
+}
+
+fn build_synced_dists_index_response(path: &str, text: String) -> Result<Response, Response> {
+    let (content_type, body) = if path.ends_with(".gz") {
+        let compressed = gzip_compress(text.as_bytes()).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Compression error: {}", e),
+            )
+                .into_response()
+        })?;
+        ("application/gzip".to_string(), compressed)
+    } else if path.ends_with(".xz") {
+        let compressed = xz_compress(text.as_bytes()).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("XZ compression error: {}", e),
+            )
+                .into_response()
+        })?;
+        ("application/x-xz".to_string(), compressed)
+    } else {
+        (content_type_for_dists_path(path), text.into_bytes())
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
+}
+async fn flat_release_file(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    release_file(State(state), Path((repo_key, String::new()))).await
+}
+
+async fn flat_in_release_file(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    in_release_file(State(state), Path((repo_key, String::new()))).await
+}
+
+async fn flat_release_gpg(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    release_gpg(State(state), Path((repo_key, String::new()))).await
+}
+
+async fn flat_dists_file(
+    state: State<SharedState>,
+    repo_key: String,
+    dists_path: &str,
+) -> Result<Response, Response> {
+    dists_proxy_catchall(
+        state,
+        Path((repo_key, String::new(), dists_path.to_string())),
+    )
+    .await
+}
+
+async fn flat_packages_index(
+    state: State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    flat_dists_file(state, repo_key, "Packages").await
+}
+
+async fn flat_packages_index_gz(
+    state: State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    flat_dists_file(state, repo_key, "Packages.gz").await
+}
+
+async fn flat_packages_index_xz(
+    state: State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    flat_dists_file(state, repo_key, "Packages.xz").await
+}
+
+async fn flat_sources_index(
+    state: State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    flat_dists_file(state, repo_key, "Sources").await
+}
+
+async fn flat_sources_index_gz(
+    state: State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    flat_dists_file(state, repo_key, "Sources.gz").await
+}
+
+async fn flat_sources_index_xz(
+    state: State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    flat_dists_file(state, repo_key, "Sources.xz").await
+}
 async fn release_file(
     State(state): State<SharedState>,
     Path((repo_key, distribution)): Path<(String, String)>,
@@ -1433,6 +1749,64 @@ fn build_packages_xz(entries: &[PackageEntry]) -> Result<Vec<u8>, io::Error> {
     xz_compress(text.as_bytes())
 }
 
+#[derive(Default)]
+struct GeneratedDistsMetadata {
+    plain_indexes: BTreeMap<String, String>,
+    release_files: Vec<(String, Vec<u8>)>,
+}
+
+fn build_synced_generated_metadata(
+    plan: &DebianSyncPlan,
+    packages_by_index_path: &BTreeMap<String, Vec<PackagesEntry>>,
+    sources_by_index_path: &BTreeMap<String, Vec<SourcesEntry>>,
+    selected_architectures: &[String],
+) -> Result<GeneratedDistsMetadata, io::Error> {
+    let mut generated = GeneratedDistsMetadata::default();
+
+    for index in &plan.package_indexes {
+        let Some(entries) = packages_by_index_path.get(&index.path) else {
+            continue;
+        };
+        let text =
+            build_generated_packages_text(entries, &index.architecture, selected_architectures);
+        add_generated_dists_index(&mut generated, &index.path, text)?;
+    }
+
+    for index in &plan.source_indexes {
+        let Some(entries) = sources_by_index_path.get(&index.path) else {
+            continue;
+        };
+        let text = build_generated_sources_text(entries);
+        add_generated_dists_index(&mut generated, &index.path, text)?;
+    }
+
+    Ok(generated)
+}
+
+fn add_generated_dists_index(
+    generated: &mut GeneratedDistsMetadata,
+    index_path: &str,
+    text: String,
+) -> Result<(), io::Error> {
+    let base_path = canonical_plain_dists_index_path(index_path).to_string();
+    if generated.plain_indexes.contains_key(&base_path) {
+        return Ok(());
+    }
+
+    let plain_bytes = text.as_bytes().to_vec();
+    generated
+        .release_files
+        .push((base_path.clone(), plain_bytes.clone()));
+    generated
+        .release_files
+        .push((format!("{base_path}.gz"), gzip_compress(&plain_bytes)?));
+    generated
+        .release_files
+        .push((format!("{base_path}.xz"), xz_compress(&plain_bytes)?));
+    generated.plain_indexes.insert(base_path, text);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GET /debian/{repo_key}/dists/{dist}/{component}/binary-{arch}/Packages
 // ---------------------------------------------------------------------------
@@ -1443,6 +1817,11 @@ async fn packages_index(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_suffix = packages_index_suffix(&component, &binary_arch, "");
+    if let Some(text) =
+        load_synced_dists_content(&state, repo.id, &distribution, &packages_suffix).await?
+    {
+        return build_synced_dists_index_response(&packages_suffix, text);
+    }
     proxy
         .dists(&packages_suffix, "text/plain; charset=utf-8", &repo)
         .await?;
@@ -1471,6 +1850,11 @@ async fn packages_index_gz(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_gz_suffix = packages_index_suffix(&component, &binary_arch, "gz");
+    if let Some(text) =
+        load_synced_dists_content(&state, repo.id, &distribution, &packages_gz_suffix).await?
+    {
+        return build_synced_dists_index_response(&packages_gz_suffix, text);
+    }
     proxy
         .dists(&packages_gz_suffix, "application/gzip", &repo)
         .await?;
@@ -1507,6 +1891,11 @@ async fn packages_index_xz(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_xz_suffix = packages_index_suffix(&component, &binary_arch, "xz");
+    if let Some(text) =
+        load_synced_dists_content(&state, repo.id, &distribution, &packages_xz_suffix).await?
+    {
+        return build_synced_dists_index_response(&packages_xz_suffix, text);
+    }
     proxy
         .dists(&packages_xz_suffix, "application/x-xz", &repo)
         .await?;
@@ -1606,7 +1995,13 @@ async fn dists_proxy_catchall(
 
     require_debian_sync_path_allowed(&state.db, repo.id, &distribution, &dists_path).await?;
 
-    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+    if let Some(text) =
+        load_synced_dists_content(&state, repo.id, &distribution, &dists_path).await?
+    {
+        return build_synced_dists_index_response(&dists_path, text);
+    }
+
+    let upstream_path = debian_dists_upstream_path(&distribution, &dists_path);
 
     // Virtual repos: walk Remote members in priority order so a Virtual
     // APT repo can serve i18n / Translation / dep11 / Sources etc. just
@@ -1724,11 +2119,30 @@ async fn pool_download(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("pool/{}/{}", component, path);
+                    let passthrough_packages = load_debian_repository_config(&state.db, repo.id)
+                        .await
+                        .map(|config| {
+                            config.package_fetch_strategy
+                                == crate::api::handlers::repositories::DebianPackageFetchStrategy::Passthrough
+                        })
+                        .unwrap_or(false);
+
                     // #895: stream .deb bodies. Default Content-Type
                     // matches the IANA registration for Debian packages
                     // (apt clients don't care; the registration just
                     // gives downstream proxies a meaningful Content-Type
                     // when upstream omits it).
+                    if passthrough_packages {
+                        return proxy_helpers::proxy_fetch_streaming_uncached(
+                            proxy,
+                            repo.id,
+                            &repo_key,
+                            upstream_url,
+                            &upstream_path,
+                            DEBIAN_BINARY_CONTENT_TYPE,
+                        )
+                        .await;
+                    }
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
@@ -2307,6 +2721,7 @@ struct DebianSyncResponse {
     repository: String,
     plans: Vec<DebianSyncPlan>,
     prefetched_packages: usize,
+    prefetched_sources: usize,
 }
 
 fn debian_sync_parse_error(context: &str, error: impl std::fmt::Display) -> Response {
@@ -2331,6 +2746,72 @@ async fn drain_prefetched_package(response: Response) -> Result<(), Response> {
     Ok(())
 }
 
+fn debian_sync_verification_error(label: &str, error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("Failed to verify upstream Debian {label}: {error}"),
+    )
+        .into_response()
+}
+
+async fn verify_upstream_release_metadata(
+    state: &SharedState,
+    config: &DebianRepositoryConfig,
+    release_text: &str,
+    release_bytes: &[u8],
+    in_release_bytes: Option<&[u8]>,
+    release_gpg_bytes: Option<&[u8]>,
+) -> Result<String, Response> {
+    let key_ref = config
+        .upstream_gpg_key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "verify_upstream_metadata=true requires upstream_gpg_key_id.",
+            )
+                .into_response()
+        })?;
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let public_key = signing_svc
+        .get_public_key_by_reference(key_ref)
+        .await
+        .map_err(|error| debian_sync_verification_error("public key lookup", error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("upstream_gpg_key_id={key_ref} did not match a stored active public key."),
+            )
+                .into_response()
+        })?;
+
+    if let Some(in_release_bytes) = in_release_bytes {
+        let in_release_text = std::str::from_utf8(in_release_bytes)
+            .map_err(|error| debian_sync_parse_error("InRelease", error))?;
+        return signing_svc
+            .verify_openpgp_cleartext_with_public_key(&public_key, in_release_text)
+            .await
+            .map_err(|error| debian_sync_verification_error("InRelease", error));
+    }
+
+    if let Some(release_gpg_bytes) = release_gpg_bytes {
+        signing_svc
+            .verify_openpgp_detached_with_public_key(&public_key, release_bytes, release_gpg_bytes)
+            .await
+            .map_err(|error| debian_sync_verification_error("Release.gpg", error))?;
+        return Ok(release_text.to_string());
+    }
+
+    Err((
+        StatusCode::BAD_GATEWAY,
+        "verify_upstream_metadata=true but upstream did not provide InRelease or Release.gpg.",
+    )
+        .into_response())
+}
+
 async fn sync_remote_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -2341,7 +2822,7 @@ async fn sync_remote_repository(
     if repo.repo_type != RepositoryType::Remote {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Debian filtered sync requires a Remote repository",
+            "Debian metadata refresh requires a Remote repository",
         )
             .into_response());
     }
@@ -2354,25 +2835,13 @@ async fn sync_remote_repository(
             )
                 .into_response()
         })?;
-    let sync = config.sync.as_ref().ok_or_else(|| {
+    let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            "Debian repository has no sync configuration",
+            "Debian metadata refresh requires repository upstream_url",
         )
             .into_response()
     })?;
-    let upstream_url = sync
-        .base_url
-        .as_deref()
-        .or(config.upstream_base_url.as_deref())
-        .or(repo.upstream_url.as_deref())
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Debian sync requires an upstream base URL",
-            )
-                .into_response()
-        })?;
     let proxy = state.proxy_service.as_deref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2381,25 +2850,42 @@ async fn sync_remote_repository(
             .into_response()
     })?;
 
-    let distributions = configured_or_fallback(&sync.distributions, &config.distributions);
+    let distributions = config.effective_distribution_paths();
     if distributions.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Debian sync requires at least one distribution",
+            "Debian metadata refresh requires at least one distribution path",
         )
             .into_response());
     }
     let filter = DebianSyncFilter {
-        distributions: distributions.to_vec(),
-        components: configured_or_fallback(&sync.components, &config.components).to_vec(),
-        architectures: configured_or_fallback(&sync.architectures, &config.architectures).to_vec(),
+        distributions: if config.flat_repository {
+            Vec::new()
+        } else {
+            distributions.clone()
+        },
+        components: config.effective_components(),
+        architectures: config.effective_architectures(),
+        include_source_packages: config.include_source_packages,
     };
-    let download_policy = DebianSyncDownloadPolicy::from_label(sync.download_policy.as_deref());
+    let download_policy = if config.package_fetch_strategy
+        == crate::api::handlers::repositories::DebianPackageFetchStrategy::PrefetchSelected
+    {
+        DebianSyncDownloadPolicy::Immediate
+    } else {
+        DebianSyncDownloadPolicy::OnDemand
+    };
     let mut plans = Vec::new();
     let mut prefetched = BTreeSet::new();
+    let mut prefetched_sources = BTreeSet::new();
 
-    for distribution in distributions {
-        let release_path = format!("dists/{distribution}/Release");
+    for distribution in &distributions {
+        let normalized_distribution = distribution.trim_matches('/');
+        let release_path = if config.flat_repository || normalized_distribution.is_empty() {
+            "Release".to_string()
+        } else {
+            format!("dists/{normalized_distribution}/Release")
+        };
         let (release_bytes, _) = proxy_helpers::proxy_fetch_capped(
             proxy,
             repo.id,
@@ -2409,20 +2895,17 @@ async fn sync_remote_repository(
             proxy_helpers::LARGE_METADATA_MAX_BYTES,
         )
         .await?;
-        let release_text = std::str::from_utf8(&release_bytes)
-            .map_err(|error| debian_sync_parse_error("Release", error))?;
-        let release = parse_release(release_text)
+        let release_text_from_release = std::str::from_utf8(&release_bytes)
             .map_err(|error| debian_sync_parse_error("Release", error))?;
 
-        // APT prefers InRelease and only falls back to Release/Release.gpg
-        // when the former is absent.  Keep every available release metadata
-        // variant warm so an eagerly-synced repository remains usable while
-        // its upstream is unavailable.  Unsigned repositories legitimately
-        // omit either signed variant, so a 404 is not a sync failure.
-        for signed_path in [
-            format!("dists/{distribution}/InRelease"),
-            format!("dists/{distribution}/Release.gpg"),
-        ] {
+        let mut in_release_bytes = None;
+        let mut release_gpg_bytes = None;
+        for signed_suffix in ["InRelease", "Release.gpg"] {
+            let signed_path = if config.flat_repository || normalized_distribution.is_empty() {
+                signed_suffix.to_string()
+            } else {
+                format!("dists/{normalized_distribution}/{signed_suffix}")
+            };
             match proxy_helpers::proxy_fetch_capped(
                 proxy,
                 repo.id,
@@ -2433,17 +2916,44 @@ async fn sync_remote_repository(
             )
             .await
             {
-                Ok(_) => {}
+                Ok((content, _)) if signed_suffix == "InRelease" => {
+                    in_release_bytes = Some(content);
+                }
+                Ok((content, _)) => {
+                    release_gpg_bytes = Some(content);
+                }
                 Err(response) if response.status() == StatusCode::NOT_FOUND => {}
                 Err(response) => return Err(response),
             }
         }
 
+        let verified_release_text = if config.verify_upstream_metadata {
+            verify_upstream_release_metadata(
+                &state,
+                &config,
+                release_text_from_release,
+                &release_bytes,
+                in_release_bytes.as_deref(),
+                release_gpg_bytes.as_deref(),
+            )
+            .await?
+        } else {
+            release_text_from_release.to_string()
+        };
+        let release = parse_release(&verified_release_text)
+            .map_err(|error| debian_sync_parse_error("Release", error))?;
+        validate_release_filter_selection(&release, &filter)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()).into_response())?;
+
         let indexes = filter_release_package_indexes(&release, &filter);
         let mut packages_by_index_path = BTreeMap::new();
         for index in &indexes {
-            let upstream_path = format!("dists/{distribution}/{}", index.path);
-            let (content, _) = proxy_helpers::proxy_fetch_capped(
+            let upstream_path = if config.flat_repository || normalized_distribution.is_empty() {
+                index.path.clone()
+            } else {
+                format!("dists/{normalized_distribution}/{}", index.path)
+            };
+            match proxy_helpers::proxy_fetch_capped(
                 proxy,
                 repo.id,
                 &repo_key,
@@ -2451,51 +2961,122 @@ async fn sync_remote_repository(
                 &upstream_path,
                 proxy_helpers::LARGE_METADATA_MAX_BYTES,
             )
-            .await?;
-            let packages = parse_packages_index(&index.path, &content)
-                .map_err(|error| debian_sync_parse_error("Packages index", error))?;
-            packages_by_index_path.insert(index.path.clone(), packages);
+            .await
+            {
+                Ok((content, _)) => {
+                    let packages = parse_packages_index(&index.path, &content)
+                        .map_err(|error| debian_sync_parse_error("Packages index", error))?;
+                    packages_by_index_path.insert(index.path.clone(), packages);
+                }
+                Err(response)
+                    if response.status() == StatusCode::NOT_FOUND
+                        && config.ignore_missing_indexes =>
+                {
+                    tracing::warn!(repo_key = %repo_key, path = %upstream_path, "selected Debian index missing upstream; continuing because ignore_missing_indexes=true");
+                }
+                Err(response) => return Err(response),
+            }
+        }
+
+        let source_indexes = filter_release_source_indexes(&release, &filter);
+        let mut sources_by_index_path = BTreeMap::new();
+        for index in &source_indexes {
+            let upstream_path = if config.flat_repository || normalized_distribution.is_empty() {
+                index.path.clone()
+            } else {
+                format!("dists/{normalized_distribution}/{}", index.path)
+            };
+            match proxy_helpers::proxy_fetch_capped(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &upstream_path,
+                proxy_helpers::LARGE_METADATA_MAX_BYTES,
+            )
+            .await
+            {
+                Ok((content, _)) => {
+                    let sources = parse_sources_index(&index.path, &content)
+                        .map_err(|error| debian_sync_parse_error("Sources index", error))?;
+                    sources_by_index_path.insert(index.path.clone(), sources);
+                }
+                Err(response)
+                    if response.status() == StatusCode::NOT_FOUND
+                        && config.ignore_missing_indexes =>
+                {
+                    tracing::warn!(repo_key = %repo_key, path = %upstream_path, "selected Debian source index missing upstream; continuing because ignore_missing_indexes=true");
+                }
+                Err(response) => return Err(response),
+            }
         }
 
         let plan = build_debian_sync_plan(
-            distribution,
+            normalized_distribution,
             &release,
             &filter,
             &packages_by_index_path,
+            &sources_by_index_path,
             download_policy,
         );
 
-        if sync.re_sign {
-            let selected_paths: BTreeSet<&str> = plan
-                .package_indexes
-                .iter()
-                .map(|index| index.path.as_str())
-                .collect();
-            let hashes = release
-                .sha256
-                .iter()
-                .filter(|hash| selected_paths.contains(hash.path.as_str()))
-                .cloned()
-                .collect();
+        if config.generated_metadata_enabled() {
+            let generated = build_synced_generated_metadata(
+                &plan,
+                &packages_by_index_path,
+                &sources_by_index_path,
+                &filter.architectures,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to generate Debian metadata: {}", error),
+                )
+                    .into_response()
+            })?;
+
+            clear_synced_dists_content(&state.db, repo.id, normalized_distribution).await?;
+            for (path, content) in &generated.plain_indexes {
+                store_synced_dists_content(
+                    &state.db,
+                    repo.id,
+                    normalized_distribution,
+                    path,
+                    content,
+                )
+                .await?;
+            }
+
             let components: BTreeSet<String> = plan
                 .package_indexes
                 .iter()
                 .map(|index| index.component.clone())
+                .chain(
+                    plan.source_indexes
+                        .iter()
+                        .map(|index| index.component.clone()),
+                )
                 .collect();
             let architectures: BTreeSet<String> = plan
                 .package_indexes
                 .iter()
                 .map(|index| index.architecture.clone())
                 .collect();
-            let filtered_release = generate_release(
-                config.suite.as_deref().unwrap_or(&release.suite),
-                config.codename.as_deref().or(release.codename.as_deref()),
-                &architectures.into_iter().collect::<Vec<_>>(),
-                &components.into_iter().collect::<Vec<_>>(),
-                hashes,
+            let filtered_release = build_release_content_from_files(
+                &release.suite,
+                release.codename.as_deref(),
+                release.description.as_deref(),
+                &components,
+                &architectures,
+                generated.release_files,
             );
-            store_synced_release_content(&state.db, repo.id, distribution, &filtered_release)
-                .await?;
+            store_synced_release_content(
+                &state.db,
+                repo.id,
+                normalized_distribution,
+                &filtered_release,
+            )
+            .await?;
         }
 
         for package in plan.package_files.iter().filter(|package| package.download) {
@@ -2513,6 +3094,21 @@ async fn sync_remote_repository(
             .await?;
             drain_prefetched_package(response).await?;
         }
+        for source in plan.source_files.iter().filter(|source| source.download) {
+            if !prefetched_sources.insert(source.filename.clone()) {
+                continue;
+            }
+            let response = proxy_helpers::proxy_fetch_streaming(
+                proxy,
+                repo.id,
+                &repo_key,
+                upstream_url,
+                &source.filename,
+                "application/octet-stream",
+            )
+            .await?;
+            drain_prefetched_package(response).await?;
+        }
         plans.push(plan);
     }
 
@@ -2520,11 +3116,26 @@ async fn sync_remote_repository(
         repository: repo_key,
         plans,
         prefetched_packages: prefetched.len(),
+        prefetched_sources: prefetched_sources.len(),
     }))
 }
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_pool_download_passthrough_package_strategy_uses_uncached_proxy() {
+        let src = include_str!("debian.rs");
+        let fn_start = src
+            .find("async fn pool_download(")
+            .expect("pool_download must exist");
+        let remote_branch_end = src[fn_start..]
+            .find("// Virtual repo: try each member in priority order")
+            .expect("pool_download remote branch must precede virtual branch");
+        let remote_branch = &src[fn_start..fn_start + remote_branch_end];
+
+        assert!(remote_branch.contains("DebianPackageFetchStrategy::Passthrough"));
+        assert!(remote_branch.contains("proxy_fetch_streaming_uncached("));
+        assert!(remote_branch.contains("proxy_fetch_streaming("));
+    }
     use super::*;
 
     fn package_entry(
@@ -2898,12 +3509,11 @@ mod tests {
     }
 
     #[test]
-    fn test_debian_sync_filters_distribution_component_and_architecture() {
+    fn test_debian_filters_distribution_component_and_architecture() {
         let config = DebianRepositoryConfig {
-            distributions: vec!["bookworm".to_string()],
+            distribution_paths: vec!["bookworm".to_string()],
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
-            sync: Some(crate::api::handlers::repositories::DebianRepositorySyncConfig::default()),
             ..Default::default()
         };
 
@@ -2931,29 +3541,73 @@ mod tests {
     }
 
     #[test]
-    fn test_release_config_fields_trim_and_fallback() {
+    fn test_flat_debian_filters_allow_only_root_distribution() {
         let config = DebianRepositoryConfig {
-            suite: Some(" stable ".to_string()),
-            codename: Some(" bookworm ".to_string()),
-            description: Some(" Filtered Debian mirror ".to_string()),
+            distribution_paths: vec!["/".to_string()],
+            flat_repository: true,
+            components: vec!["*".to_string()],
             ..Default::default()
         };
 
-        assert_eq!(
-            release_config_value(config.suite.as_ref(), "jammy"),
-            "stable"
-        );
-        assert_eq!(
-            release_config_value(config.codename.as_ref(), "jammy"),
-            "bookworm"
-        );
-        assert_eq!(
-            release_config_description(Some(&config)),
-            Some("Filtered Debian mirror")
-        );
-        assert_eq!(release_config_value(None, "jammy"), "jammy");
+        assert!(debian_sync_path_allowed(&config, "", "Packages.xz"));
+        assert!(debian_sync_path_allowed(&config, "/", "Sources.gz"));
+        assert!(!debian_sync_path_allowed(
+            &config,
+            "bookworm",
+            "main/binary-amd64/Packages.xz"
+        ));
     }
 
+    #[test]
+    fn test_flat_debian_upstream_paths_are_root_relative() {
+        assert_eq!(debian_dists_upstream_path("", "Release"), "Release");
+        assert_eq!(debian_dists_upstream_path("", "Packages.xz"), "Packages.xz");
+        assert_eq!(
+            debian_dists_upstream_path("bookworm", "main/binary-amd64/Packages.xz"),
+            "dists/bookworm/main/binary-amd64/Packages.xz"
+        );
+    }
+    #[test]
+    fn test_debian_filters_treat_wildcard_components_and_architectures_as_all() {
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["bookworm".to_string()],
+            components: vec!["*".to_string()],
+            architectures: Vec::new(),
+            ..Default::default()
+        };
+
+        assert!(debian_sync_path_allowed(
+            &config,
+            "bookworm",
+            "contrib/binary-arm64/Packages.xz"
+        ));
+    }
+
+    #[test]
+    fn test_effective_release_layout_uses_discovered_values_for_wildcards() {
+        let config = DebianRepositoryConfig {
+            components: vec!["*".to_string()],
+            architectures: Vec::new(),
+            ..Default::default()
+        };
+        let discovered_components = BTreeSet::from(["main".to_string(), "universe".to_string()]);
+        let discovered_architectures = BTreeSet::from(["amd64".to_string(), "arm64".to_string()]);
+
+        let (components, architectures) = effective_release_layout(
+            Some(&config),
+            discovered_components,
+            discovered_architectures,
+        );
+
+        assert_eq!(
+            components.into_iter().collect::<Vec<_>>(),
+            vec!["main".to_string(), "universe".to_string()]
+        );
+        assert_eq!(
+            architectures.into_iter().collect::<Vec<_>>(),
+            vec!["amd64".to_string(), "arm64".to_string()]
+        );
+    }
     // -----------------------------------------------------------------------
     // build_packages_text
     // -----------------------------------------------------------------------
@@ -3059,6 +3713,227 @@ mod tests {
         assert!(text.contains("SHA256: sha256\n"));
     }
 
+    #[test]
+    fn test_build_generated_packages_text_filters_arch_and_preserves_hashes() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("Multi-Arch".to_string(), "same".to_string());
+        let entries = vec![
+            PackagesEntry {
+                control: DebControl {
+                    package: "libdemo".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "amd64".to_string(),
+                    maintainer: Some("Maintainer <m@example.test>".to_string()),
+                    description: Some("demo library".to_string()),
+                    extra,
+                    ..DebControl::default()
+                },
+                filename: Some("pool/main/libd/libdemo/libdemo_1.0_amd64.deb".to_string()),
+                size: Some(1234),
+                md5sum: Some("md5".to_string()),
+                sha1: Some("sha1".to_string()),
+                sha256: Some("sha256".to_string()),
+            },
+            PackagesEntry {
+                control: DebControl {
+                    package: "shared-data".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "all".to_string(),
+                    description: Some("shared data".to_string()),
+                    ..DebControl::default()
+                },
+                filename: Some("pool/main/s/shared-data/shared-data_1.0_all.deb".to_string()),
+                size: Some(77),
+                md5sum: None,
+                sha1: None,
+                sha256: Some("sha256-all".to_string()),
+            },
+            PackagesEntry {
+                control: DebControl {
+                    package: "libother".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "arm64".to_string(),
+                    description: Some("other arch".to_string()),
+                    ..DebControl::default()
+                },
+                filename: Some("pool/main/libo/libother/libother_1.0_arm64.deb".to_string()),
+                size: Some(99),
+                md5sum: None,
+                sha1: None,
+                sha256: Some("sha256-arm".to_string()),
+            },
+        ];
+
+        let text = build_generated_packages_text(&entries, "amd64", &["amd64".to_string()]);
+        assert!(text.contains("Package: libdemo\n"));
+        assert!(text.contains("Package: shared-data\n"));
+        assert!(!text.contains("Package: libother\n"));
+        assert!(text.contains("Multi-Arch: same\n"));
+        assert!(text.contains("Filename: pool/main/libd/libdemo/libdemo_1.0_amd64.deb\n"));
+        assert!(text.contains("Size: 1234\n"));
+        assert!(text.contains("MD5sum: md5\n"));
+        assert!(text.contains("SHA1: sha1\n"));
+        assert!(text.contains("SHA256: sha256\n"));
+    }
+
+    #[test]
+    fn test_build_generated_packages_text_filters_flat_indexes_by_selected_architectures() {
+        let entries = vec![
+            PackagesEntry {
+                control: DebControl {
+                    package: "libdemo".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "amd64".to_string(),
+                    description: Some("demo library".to_string()),
+                    ..DebControl::default()
+                },
+                filename: Some("libdemo_1.0_amd64.deb".to_string()),
+                size: Some(1234),
+                md5sum: None,
+                sha1: None,
+                sha256: Some("sha256".to_string()),
+            },
+            PackagesEntry {
+                control: DebControl {
+                    package: "libother".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "arm64".to_string(),
+                    description: Some("other arch".to_string()),
+                    ..DebControl::default()
+                },
+                filename: Some("libother_1.0_arm64.deb".to_string()),
+                size: Some(99),
+                md5sum: None,
+                sha1: None,
+                sha256: Some("sha256-arm".to_string()),
+            },
+        ];
+
+        let text = build_generated_packages_text(&entries, "", &["amd64".to_string()]);
+        assert!(text.contains("Package: libdemo\n"));
+        assert!(!text.contains("Package: libother\n"));
+    }
+    #[test]
+    fn test_build_generated_sources_text_preserves_hash_sections() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "Maintainer".to_string(),
+            "Maintainer <m@example.test>".to_string(),
+        );
+        let entries = vec![SourcesEntry {
+            package: "demo-src".to_string(),
+            version: "1.0".to_string(),
+            directory: "pool/main/d/demo-src".to_string(),
+            files: vec![SourceFileEntry {
+                filename: "demo-src_1.0.dsc".to_string(),
+                size: 321,
+                md5sum: Some("md5".to_string()),
+                sha1: Some("sha1".to_string()),
+                sha256: Some("sha256".to_string()),
+                sha512: Some("sha512".to_string()),
+            }],
+            extra,
+        }];
+
+        let text = build_generated_sources_text(&entries);
+        assert!(text.contains("Package: demo-src\n"));
+        assert!(text.contains("Version: 1.0\n"));
+        assert!(text.contains("Directory: pool/main/d/demo-src\n"));
+        assert!(text.contains("Maintainer: Maintainer <m@example.test>\n"));
+        assert!(text.contains("Files:\n md5 321 demo-src_1.0.dsc\n"));
+        assert!(text.contains("Checksums-Sha1:\n sha1 321 demo-src_1.0.dsc\n"));
+        assert!(text.contains("Checksums-Sha256:\n sha256 321 demo-src_1.0.dsc\n"));
+        assert!(text.contains("Checksums-Sha512:\n sha512 321 demo-src_1.0.dsc\n"));
+    }
+
+    #[test]
+    fn test_synced_generated_metadata_builds_indexes_and_release_hashes() {
+        let package_index = crate::formats::debian::DebianIndexPath {
+            component: "main".to_string(),
+            architecture: "amd64".to_string(),
+            path: "main/binary-amd64/Packages.xz".to_string(),
+        };
+        let source_index = crate::formats::debian::DebianSourceIndexPath {
+            component: "main".to_string(),
+            path: "main/source/Sources.gz".to_string(),
+        };
+        let plan = DebianSyncPlan {
+            distribution: "jammy".to_string(),
+            release_paths: vec![],
+            package_indexes: vec![package_index.clone()],
+            source_indexes: vec![source_index.clone()],
+            package_files: vec![],
+            source_files: vec![],
+            missing_package_indexes: vec![],
+            missing_source_indexes: vec![],
+        };
+        let mut packages = BTreeMap::new();
+        packages.insert(
+            package_index.path.clone(),
+            vec![PackagesEntry {
+                control: DebControl {
+                    package: "libdemo".to_string(),
+                    version: "1.0".to_string(),
+                    architecture: "amd64".to_string(),
+                    description: Some("demo".to_string()),
+                    ..DebControl::default()
+                },
+                filename: Some("pool/main/libd/libdemo/libdemo_1.0_amd64.deb".to_string()),
+                size: Some(123),
+                md5sum: None,
+                sha1: None,
+                sha256: Some("sha256".to_string()),
+            }],
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            source_index.path.clone(),
+            vec![SourcesEntry {
+                package: "demo-src".to_string(),
+                version: "1.0".to_string(),
+                directory: "pool/main/d/demo-src".to_string(),
+                files: vec![],
+                extra: BTreeMap::new(),
+            }],
+        );
+
+        let generated =
+            build_synced_generated_metadata(&plan, &packages, &sources, &["amd64".to_string()])
+                .unwrap();
+        assert!(generated
+            .plain_indexes
+            .contains_key("main/binary-amd64/Packages"));
+        assert!(generated.plain_indexes.contains_key("main/source/Sources"));
+        assert!(generated
+            .release_files
+            .iter()
+            .any(|(path, _)| path == "main/binary-amd64/Packages.gz"));
+        assert!(generated
+            .release_files
+            .iter()
+            .any(|(path, _)| path == "main/source/Sources.xz"));
+
+        let components = BTreeSet::from(["main".to_string()]);
+        let architectures = BTreeSet::from(["amd64".to_string()]);
+        let release = build_release_content_from_files(
+            "jammy",
+            Some("jammy"),
+            None,
+            &components,
+            &architectures,
+            generated.release_files,
+        );
+        assert!(release.contains("MD5Sum:\n"));
+        assert!(release.contains("SHA1:\n"));
+        assert!(release.contains("SHA256:\n"));
+        assert!(release.contains("SHA512:\n"));
+        assert!(release.contains(" main/binary-amd64/Packages\n"));
+        assert!(release.contains(" main/binary-amd64/Packages.gz\n"));
+        assert!(release.contains(" main/binary-amd64/Packages.xz\n"));
+        assert!(release.contains(" main/source/Sources\n"));
+        assert!(release.contains(" main/source/Sources.gz\n"));
+        assert!(release.contains(" main/source/Sources.xz\n"));
+    }
     #[test]
     fn test_package_matches_requested_arch() {
         assert!(package_matches_requested_arch("amd64", "amd64"));
