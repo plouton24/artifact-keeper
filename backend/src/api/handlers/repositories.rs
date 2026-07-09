@@ -885,6 +885,11 @@ fn validate_debian_repository_config(
             "metadata_strategy=filter_generate_and_sign requires signing_key_id.".to_string(),
         ));
     }
+    if config.metadata_strategy.signs_metadata() && !config.verify_upstream_metadata {
+        return Err(AppError::Validation(
+            "metadata_strategy=filter_generate_and_sign requires verify_upstream_metadata=true so Artifact Keeper only re-signs metadata from a verified upstream.".to_string(),
+        ));
+    }
     if config.verify_upstream_metadata
         && config
             .upstream_gpg_key_id
@@ -913,6 +918,47 @@ async fn upsert_debian_config(
     upsert_repo_config(db, repo_id, DEBIAN_REPOSITORY_CONFIG_KEY, &value).await
 }
 
+/// Signing-config values to persist when saving a Debian repository config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DebianSigningUpdate {
+    signing_key_id: Option<Uuid>,
+    sign_metadata: bool,
+    sign_packages: bool,
+    require_signatures: bool,
+}
+
+/// Decide how saving a Debian config should touch the repository's signing
+/// configuration.
+///
+/// The Debian config may point at a signing key and may *enable* metadata
+/// signing (metadata_strategy=filter_generate_and_sign), but saving it must
+/// never silently turn OFF signing that was configured elsewhere via the
+/// dedicated signing API. So the enable flag is OR-ed with the existing state
+/// and the package-signing / require-signatures settings are preserved rather
+/// than clobbered to false. Returns `None` when there is nothing to persist and
+/// no existing row, so saving Debian options never creates an empty
+/// signing-config row as a side effect.
+fn resolve_debian_signing_update(
+    existing: Option<&crate::models::signing_key::RepositorySigningConfig>,
+    config: &DebianRepositoryConfig,
+) -> Option<DebianSigningUpdate> {
+    let existing_key = existing.and_then(|existing| existing.signing_key_id);
+    let signing_key_id = config.signing_key_id.or(existing_key);
+    let sign_metadata =
+        config.signing_enabled() || existing.is_some_and(|existing| existing.sign_metadata);
+
+    if existing.is_none() && signing_key_id.is_none() && !sign_metadata {
+        return None;
+    }
+
+    Some(DebianSigningUpdate {
+        signing_key_id,
+        sign_metadata,
+        sign_packages: existing.is_some_and(|existing| existing.sign_packages),
+        require_signatures: existing.is_some_and(|existing| existing.require_signatures),
+    })
+}
+
 async fn sync_debian_signing_config(
     state: &SharedState,
     repo_id: Uuid,
@@ -920,16 +966,18 @@ async fn sync_debian_signing_config(
 ) -> Result<()> {
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let existing = signing_svc.get_signing_config(repo_id).await?;
-    let existing_key = existing.as_ref().and_then(|config| config.signing_key_id);
-    let signing_key_id = config.signing_key_id.or(existing_key);
+
+    let Some(update) = resolve_debian_signing_update(existing.as_ref(), config) else {
+        return Ok(());
+    };
 
     signing_svc
         .update_signing_config(
             repo_id,
-            signing_key_id,
-            config.signing_enabled(),
-            false,
-            false,
+            update.signing_key_id,
+            update.sign_metadata,
+            update.sign_packages,
+            update.require_signatures,
         )
         .await?;
     Ok(())
@@ -7509,6 +7557,103 @@ mod tests {
         }
     }
 
+    fn signing_config_fixture(
+        signing_key_id: Option<Uuid>,
+        sign_metadata: bool,
+        sign_packages: bool,
+        require_signatures: bool,
+    ) -> crate::models::signing_key::RepositorySigningConfig {
+        crate::models::signing_key::RepositorySigningConfig {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            signing_key_id,
+            sign_metadata,
+            sign_packages,
+            require_signatures,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_saving_debian_config_never_disables_existing_signing() {
+        // Existing signing enabled via the signing API, Debian config does not
+        // request signing: the enabled flags and key must be preserved.
+        let existing = signing_config_fixture(Some(Uuid::new_v4()), true, true, true);
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            metadata_strategy: DebianMetadataStrategy::FilterAndGenerate,
+            ..Default::default()
+        };
+        let update =
+            resolve_debian_signing_update(Some(&existing), &config).expect("update expected");
+        assert!(update.sign_metadata, "must not silently disable signing");
+        assert!(update.sign_packages, "package signing must be preserved");
+        assert!(
+            update.require_signatures,
+            "require_signatures must be preserved"
+        );
+        assert_eq!(update.signing_key_id, existing.signing_key_id);
+    }
+
+    #[test]
+    fn test_saving_debian_config_can_enable_signing_and_set_key() {
+        let key = Uuid::new_v4();
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            metadata_strategy: DebianMetadataStrategy::FilterGenerateAndSign,
+            signing_key_id: Some(key),
+            verify_upstream_metadata: true,
+            upstream_gpg_key_id: Some("ubuntu-archive-key".to_string()),
+            ..Default::default()
+        };
+        let update = resolve_debian_signing_update(None, &config).expect("update expected");
+        assert!(update.sign_metadata);
+        assert_eq!(update.signing_key_id, Some(key));
+        assert!(!update.sign_packages);
+        assert!(!update.require_signatures);
+    }
+
+    #[test]
+    fn test_saving_plain_debian_config_creates_no_signing_row() {
+        // No existing config, nothing requested: don't create an empty row.
+        let config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(resolve_debian_signing_update(None, &config), None);
+    }
+
+    #[test]
+    fn test_debian_signing_requires_upstream_verification() {
+        // With a signing key but no upstream verification, signing must be
+        // rejected so Artifact Keeper never re-signs unverified upstream metadata.
+        let mut config = DebianRepositoryConfig {
+            distribution_paths: vec!["jammy".to_string()],
+            metadata_strategy: DebianMetadataStrategy::FilterGenerateAndSign,
+            signing_key_id: Some(Uuid::new_v4()),
+            verify_upstream_metadata: false,
+            ..Default::default()
+        };
+        let err = validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config))
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(
+                msg.contains("requires verify_upstream_metadata=true"),
+                "unexpected error: {msg}"
+            ),
+            other => panic!("expected validation error, got {other:?}"),
+        }
+
+        // Turning on verification (with the key reference verification needs)
+        // makes the signing configuration valid.
+        config.verify_upstream_metadata = true;
+        config.upstream_gpg_key_id = Some("ubuntu-archive-key".to_string());
+        assert!(
+            validate_debian_repository_config(&RepositoryFormat::Debian, Some(&config)).is_ok()
+        );
+    }
+
     #[test]
     fn test_debian_flat_repository_validation() {
         let config = DebianRepositoryConfig {
@@ -7672,8 +7817,20 @@ mod tests {
         let helper_body = &source[helper_start..helper_end];
         assert!(helper_body.contains("SigningService::new("));
         assert!(helper_body.contains(".update_signing_config("));
-        assert!(helper_body.contains("config.signing_enabled()"));
-        assert!(helper_body.contains("config.signing_key_id.or(existing_key)"));
+        assert!(helper_body.contains("resolve_debian_signing_update("));
+
+        // The preservation logic lives in the pure resolver so it can be unit
+        // tested; it must OR the enable flag and reuse the existing key.
+        let resolver_start = source
+            .find("fn resolve_debian_signing_update(")
+            .expect("resolver not found");
+        let resolver_end = source[resolver_start..]
+            .find("\nasync fn sync_debian_signing_config(")
+            .map(|offset| resolver_start + offset)
+            .expect("resolver end not found");
+        let resolver_body = &source[resolver_start..resolver_end];
+        assert!(resolver_body.contains("config.signing_enabled()"));
+        assert!(resolver_body.contains("config.signing_key_id.or(existing_key)"));
 
         for handler in ["create_repository", "update_repository"] {
             let marker = format!("pub async fn {handler}(");
