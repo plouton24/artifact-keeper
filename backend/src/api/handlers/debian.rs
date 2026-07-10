@@ -3436,6 +3436,31 @@ fn debian_sync_parse_error(context: &str, error: impl std::fmt::Display) -> Resp
         .into_response()
 }
 
+/// Decompress + parse a Packages index off the async runtime.
+/// Indexes can inflate up to `MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES` and must not
+/// block the Tokio executor (CONTRIBUTING spawn_blocking guidance).
+async fn parse_packages_index_blocking(
+    path: String,
+    content: Bytes,
+) -> Result<Vec<PackagesEntry>, crate::error::AppError> {
+    tokio::task::spawn_blocking(move || parse_packages_index(&path, &content))
+        .await
+        .map_err(|e| {
+            crate::error::AppError::Internal(format!("Packages index parse task failed: {e}"))
+        })?
+}
+
+async fn parse_sources_index_blocking(
+    path: String,
+    content: Bytes,
+) -> Result<Vec<SourcesEntry>, crate::error::AppError> {
+    tokio::task::spawn_blocking(move || parse_sources_index(&path, &content))
+        .await
+        .map_err(|e| {
+            crate::error::AppError::Internal(format!("Sources index parse task failed: {e}"))
+        })?
+}
+
 async fn drain_prefetched_package(response: Response) -> Result<(), Response> {
     let mut stream = response.into_body().into_data_stream();
     while let Some(chunk) = stream.next().await {
@@ -3689,7 +3714,8 @@ async fn sync_remote_repository(
                         config.verify_upstream_metadata,
                     )
                     .map_err(|error| debian_sync_verification_error("Packages index", error))?;
-                    let packages = parse_packages_index(&index.path, &content)
+                    let packages = parse_packages_index_blocking(index.path.clone(), content)
+                        .await
                         .map_err(|error| debian_sync_parse_error("Packages index", error))?;
                     packages_by_index_path.insert(index.path.clone(), packages);
                 }
@@ -3729,7 +3755,8 @@ async fn sync_remote_repository(
                         config.verify_upstream_metadata,
                     )
                     .map_err(|error| debian_sync_verification_error("Sources index", error))?;
-                    let sources = parse_sources_index(&index.path, &content)
+                    let sources = parse_sources_index_blocking(index.path.clone(), content)
+                        .await
                         .map_err(|error| debian_sync_parse_error("Sources index", error))?;
                     sources_by_index_path.insert(index.path.clone(), sources);
                 }
