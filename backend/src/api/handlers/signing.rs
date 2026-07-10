@@ -15,7 +15,8 @@ use crate::error::{AppError, Result};
 use crate::models::signing_key::{RepositorySigningConfig, SigningKeyPublic};
 use crate::services::repository_service::RepositoryService;
 use crate::services::signing_service::{
-    normalize_key_type, CreateKeyRequest, ImportPublicKeyRequest, SigningService,
+    normalize_key_type, CreateKeyRequest, ImportExternalKeyRequest, ImportPublicKeyRequest,
+    SigningService,
 };
 
 /// Create signing key management routes.
@@ -24,6 +25,7 @@ pub fn router() -> Router<SharedState> {
         // Key CRUD
         .route("/keys", get(list_keys).post(create_key))
         .route("/keys/import-public", post(import_public_key))
+        .route("/keys/external", post(register_external_key))
         .route("/keys/:key_id", get(get_key).delete(delete_key))
         .route("/keys/:key_id/revoke", post(revoke_key))
         .route("/keys/:key_id/rotate", post(rotate_key))
@@ -65,6 +67,22 @@ pub struct ImportPublicKeyPayload {
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportExternalKeyPayload {
+    pub repository_id: Option<Uuid>,
+    pub name: String,
+    /// ASCII-armored OpenPGP public key corresponding to the external private key.
+    pub public_key_pem: String,
+    /// HSM key URI / PKCS#11 label / KMS ARN.
+    pub external_key_ref: String,
+    /// Provider id (`hsm`, `kms`, `pkcs11`, …). Defaults to `hsm`.
+    pub signing_provider: Option<String>,
+    pub key_type: Option<String>,
+    pub algorithm: Option<String>,
+    pub uid_name: Option<String>,
+    pub uid_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -242,6 +260,56 @@ async fn import_public_key(
             uid_name: payload.uid_name,
             uid_email: payload.uid_email,
             expires_at: payload.expires_at,
+            created_by: Some(auth.user_id),
+        })
+        .await?;
+    Ok(Json(key))
+}
+
+/// Register an external/HSM signing key (public key + external key reference).
+///
+/// Stores the public key with no local private material. Signing is performed
+/// by the configured provider (or via `AK_EXTERNAL_SIGN_COMMAND` when set).
+#[utoipa::path(
+    post,
+    path = "/keys/external",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    request_body = ImportExternalKeyPayload,
+    responses(
+        (status = 200, description = "Registered external/HSM signing key", body = SigningKeyPublic),
+        (status = 400, description = "Invalid public key or external_key_ref", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Fingerprint already exists", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn register_external_key(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<ImportExternalKeyPayload>,
+) -> Result<Json<SigningKeyPublic>> {
+    require_signing_admin(&auth)?;
+
+    if let Some(repo_id) = payload.repository_id {
+        RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+    }
+
+    let svc = signing_service(&state);
+    let key = svc
+        .register_external_signing_key(ImportExternalKeyRequest {
+            repository_id: payload.repository_id,
+            name: payload.name,
+            public_key_pem: payload.public_key_pem,
+            external_key_ref: payload.external_key_ref,
+            signing_provider: payload.signing_provider,
+            key_type: payload.key_type,
+            algorithm: payload.algorithm,
+            uid_name: payload.uid_name,
+            uid_email: payload.uid_email,
             created_by: Some(auth.user_id),
         })
         .await?;
@@ -525,6 +593,7 @@ fn signing_config_fields(
         list_keys,
         create_key,
         import_public_key,
+        register_external_key,
         get_key,
         delete_key,
         revoke_key,
@@ -538,6 +607,7 @@ fn signing_config_fields(
         ListKeysQuery,
         CreateKeyPayload,
         ImportPublicKeyPayload,
+        ImportExternalKeyPayload,
         UpdateSigningConfigPayload,
         KeyListResponse,
         SigningConfigResponse,
@@ -677,6 +747,45 @@ mod tests {
         assert!(payload.public_key.contains("BEGIN PGP PUBLIC KEY BLOCK"));
         assert!(payload.repository_id.is_none());
         assert!(payload.expires_at.is_none());
+    }
+
+    #[test]
+    fn test_register_external_key_requires_admin_gate() {
+        let src = include_str!("signing.rs");
+        let start = src
+            .find("async fn register_external_key(")
+            .expect("register_external_key handler must exist");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nasync fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        assert!(
+            rest[..end].contains("require_signing_admin"),
+            "register_external_key MUST call require_signing_admin"
+        );
+        match require_signing_admin(&non_admin_jwt()) {
+            Err(AppError::Authorization(_)) => {}
+            other => panic!("expected 403 for non-admin external register, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_import_external_key_payload_deserialize() {
+        let json = r#"{
+            "name": "hsm-release",
+            "public_key_pem": "-----BEGIN PGP PUBLIC KEY BLOCK-----\n...\n-----END PGP PUBLIC KEY BLOCK-----",
+            "external_key_ref": "pkcs11:token=ak;object=release",
+            "signing_provider": "hsm"
+        }"#;
+        let payload: ImportExternalKeyPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.name, "hsm-release");
+        assert_eq!(
+            payload.external_key_ref,
+            "pkcs11:token=ak;object=release"
+        );
+        assert_eq!(payload.signing_provider.as_deref(), Some("hsm"));
+        assert!(payload.algorithm.is_none());
     }
 
     #[test]
@@ -945,6 +1054,8 @@ mod tests {
             key_id: Some("1234".to_string()),
             public_key_pem: "-----BEGIN PUBLIC KEY-----".to_string(),
             can_sign: true,
+            external_key_ref: None,
+            signing_provider: "local".to_string(),
             algorithm: "rsa4096".to_string(),
             uid_name: None,
             uid_email: None,

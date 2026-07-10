@@ -438,6 +438,8 @@ pub enum DebianPackageFetchStrategy {
     "metadata_strategy": "upstream_passthrough",
     "package_fetch_strategy": "cache_on_request",
     "ignore_missing_indexes": false,
+    "package_queries": ["nginx", "curl*"],
+    "resolve_dependencies": true,
     "signing_key_id": null,
     "metadata_paths": [
         "dists/jammy/Release",
@@ -482,6 +484,12 @@ pub struct DebianRepositoryConfig {
     /// Continue when safe if selected upstream index files are missing.
     #[serde(default)]
     pub ignore_missing_indexes: bool,
+    /// Optional package name queries for filtered sync (exact or `name*` glob).
+    #[serde(default)]
+    pub package_queries: Vec<String>,
+    /// When package_queries is set, include Depends/Pre-Depends closure during sync.
+    #[serde(default)]
+    pub resolve_dependencies: bool,
     /// Private signing key reference used only for generated local Release metadata.
     #[serde(default)]
     pub signing_key_id: Option<Uuid>,
@@ -607,6 +615,10 @@ impl DebianRepositoryConfig {
 
     pub(crate) fn effective_distribution_paths(&self) -> Vec<String> {
         normalized_non_empty_values(&self.distribution_paths)
+    }
+
+    pub(crate) fn effective_package_queries(&self) -> Vec<String> {
+        normalized_non_empty_values(&self.package_queries)
     }
 
     fn hydrated_for_response(&self, repo_key: &str, upstream_url: Option<&str>) -> Self {

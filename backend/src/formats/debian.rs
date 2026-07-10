@@ -975,9 +975,7 @@ fn package_index_compression_rank(path: &str) -> u8 {
         4
     } else if path.ends_with(".zst") || path.ends_with(".zstd") {
         3
-    } else if path.ends_with(".gz") {
-        2
-    } else if path.ends_with(".bz2") {
+    } else if path.ends_with(".gz") || path.ends_with(".bz2") {
         2
     } else {
         1
@@ -1044,10 +1042,9 @@ pub fn filter_packages_by_query_with_dependencies(
     let mut selected: HashSet<usize> = HashSet::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
     for (idx, entry) in entries.iter().enumerate() {
-        if package_name_matches_queries(&entry.control.package, queries) {
-            if selected.insert(idx) {
-                queue.push_back(idx);
-            }
+        if package_name_matches_queries(&entry.control.package, queries) && selected.insert(idx)
+        {
+            queue.push_back(idx);
         }
     }
 
@@ -1066,7 +1063,7 @@ pub fn filter_packages_by_query_with_dependencies(
                     for &dep_idx in by_name
                         .get(dep_name)
                         .into_iter()
-                        .chain(by_provide.get(dep_name).into_iter())
+                        .chain(by_provide.get(dep_name))
                         .flatten()
                     {
                         if selected.insert(dep_idx) {
@@ -1081,7 +1078,8 @@ pub fn filter_packages_by_query_with_dependencies(
     entries
         .iter()
         .enumerate()
-        .filter_map(|(idx, entry)| selected.contains(&idx).then(|| entry.clone()))
+        .filter(|(idx, _)| selected.contains(idx))
+        .map(|(_, entry)| entry.clone())
         .collect()
 }
 
@@ -1823,6 +1821,35 @@ fn is_debian_metadata_path(path: &str) -> bool {
 
 fn is_debian_pool_artifact(path: &str) -> bool {
     path.starts_with("pool/") && (path.ends_with(".deb") || path.ends_with(".udeb"))
+}
+
+/// Stable promotion target path for Debian packages.
+///
+/// Pool layout (`pool/<component>/…`) and flat `.deb`/`.udeb` paths are kept
+/// unchanged so promoted artifacts remain addressable by the same Filename in
+/// Packages indexes.
+pub fn debian_promotion_target_path(source_path: &str) -> String {
+    source_path.to_string()
+}
+
+/// True when any Packages index text lists `pool_path` as a `Filename:` entry.
+///
+/// Used for reference-aware cleanup before deleting a pool artifact: if the
+/// path is still referenced by generated or cached Packages indexes, callers
+/// should retain the blob (or regenerate indexes first).
+pub fn debian_pool_path_still_referenced(packages_index_texts: &[String], pool_path: &str) -> bool {
+    let pool_path = pool_path.trim();
+    if pool_path.is_empty() {
+        return false;
+    }
+    packages_index_texts.iter().any(|text| {
+        text.lines().any(|line| {
+            let Some(value) = line.strip_prefix("Filename:") else {
+                return false;
+            };
+            value.trim() == pool_path
+        })
+    })
 }
 
 fn push_packages_field(entry: &mut String, key: &str, value: &str) {
@@ -3491,6 +3518,40 @@ Source: full-pkg-src
             "pool/main/n/nginx/nginx_1.0_amd64.deb"
         ));
         assert!(!is_flat_repository_package_path("Release"));
+    }
+
+    #[test]
+    fn test_debian_promotion_target_path_keeps_pool_layout() {
+        assert_eq!(
+            debian_promotion_target_path("pool/main/n/nginx/nginx_1.0_amd64.deb"),
+            "pool/main/n/nginx/nginx_1.0_amd64.deb"
+        );
+        assert_eq!(
+            debian_promotion_target_path("pool/debian-installer/m/module/module_1_amd64.udeb"),
+            "pool/debian-installer/m/module/module_1_amd64.udeb"
+        );
+        assert_eq!(
+            debian_promotion_target_path("nginx_1.0_amd64.deb"),
+            "nginx_1.0_amd64.deb"
+        );
+    }
+
+    #[test]
+    fn test_debian_pool_path_still_referenced() {
+        let packages = vec![
+            "Package: nginx\nFilename: pool/main/n/nginx/nginx_1.0_amd64.deb\n\n".to_string(),
+            "Package: curl\nFilename: pool/main/c/curl/curl_1.0_amd64.deb\n\n".to_string(),
+        ];
+        assert!(debian_pool_path_still_referenced(
+            &packages,
+            "pool/main/n/nginx/nginx_1.0_amd64.deb"
+        ));
+        assert!(!debian_pool_path_still_referenced(
+            &packages,
+            "pool/main/v/vim/vim_1.0_amd64.deb"
+        ));
+        assert!(!debian_pool_path_still_referenced(&packages, ""));
+        assert!(!debian_pool_path_still_referenced(&[], "pool/main/n/nginx/nginx_1.0_amd64.deb"));
     }
 
     #[test]

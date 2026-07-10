@@ -287,6 +287,106 @@ pub struct ImportPublicKeyRequest {
     pub created_by: Option<Uuid>,
 }
 
+/// Request to register an external/HSM signing key (public key + external ref).
+pub struct ImportExternalKeyRequest {
+    pub repository_id: Option<Uuid>,
+    pub name: String,
+    /// ASCII-armored OpenPGP public key corresponding to the external private key.
+    pub public_key_pem: String,
+    /// HSM key URI / PKCS#11 label / KMS ARN.
+    pub external_key_ref: String,
+    /// Provider id (`hsm`, `kms`, `pkcs11`, …). Defaults to `hsm`.
+    pub signing_provider: Option<String>,
+    pub key_type: Option<String>,
+    pub algorithm: Option<String>,
+    pub uid_name: Option<String>,
+    pub uid_email: Option<String>,
+    pub created_by: Option<Uuid>,
+}
+
+/// Split `AK_EXTERNAL_SIGN_COMMAND` into program + args without invoking a shell.
+///
+/// Accepts whitespace-separated tokens. The first token is the executable path;
+/// remaining tokens are arguments. Empty / whitespace-only values return `None`.
+pub(crate) fn parse_external_sign_command(raw: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = raw.split_whitespace();
+    let program = parts.next()?.to_string();
+    if program.is_empty() {
+        return None;
+    }
+    let args: Vec<String> = parts.map(str::to_string).collect();
+    Some((program, args))
+}
+
+/// Invoke an external signer: release/text bytes on stdin → armored signature on stdout.
+///
+/// Runs outside the async runtime (`spawn_blocking`). Does not use a shell.
+fn sign_via_external_command_blocking(program: String, args: Vec<String>, input: Vec<u8>) -> Result<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "Failed to spawn AK_EXTERNAL_SIGN_COMMAND ({program}): {e}"
+            ))
+        })?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            AppError::Internal("AK_EXTERNAL_SIGN_COMMAND stdin unavailable".to_string())
+        })?;
+        stdin.write_all(&input).map_err(|e| {
+            AppError::Internal(format!("Failed to write to AK_EXTERNAL_SIGN_COMMAND: {e}"))
+        })?;
+    }
+
+    let output = child.wait_with_output().map_err(|e| {
+        AppError::Internal(format!("AK_EXTERNAL_SIGN_COMMAND failed to exit: {e}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::Internal(format!(
+            "AK_EXTERNAL_SIGN_COMMAND exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    let armored = String::from_utf8(output.stdout).map_err(|e| {
+        AppError::Internal(format!(
+            "AK_EXTERNAL_SIGN_COMMAND returned non-UTF-8 stdout: {e}"
+        ))
+    })?;
+    let armored = armored.trim().to_string();
+    if armored.is_empty() {
+        return Err(AppError::Internal(
+            "AK_EXTERNAL_SIGN_COMMAND returned empty signature".to_string(),
+        ));
+    }
+    Ok(armored)
+}
+
+/// Error when an external/HSM key is used for in-process signing without
+/// `AK_EXTERNAL_SIGN_COMMAND` configured.
+fn external_key_in_process_error() -> AppError {
+    // In-process OpenPGP signing requires local private key material.
+    // External/HSM keys must be signed by the configured provider (or via
+    // AK_EXTERNAL_SIGN_COMMAND when set).
+    AppError::Validation(
+        "In-process signing requires a local private key; external/HSM signing \
+         must be performed by the configured provider (set AK_EXTERNAL_SIGN_COMMAND \
+         to enable out-of-process signing for external keys)"
+            .to_string(),
+    )
+}
+
 impl SigningService {
     pub fn new(db: PgPool, encryption_key: &str) -> Self {
         Self {
@@ -356,6 +456,8 @@ impl SigningService {
             key_id: Some(key_id),
             public_key_pem: public_key_out,
             can_sign: true,
+            external_key_ref: None,
+            signing_provider: "local".to_string(),
             algorithm: req.algorithm,
             uid_name: req.uid_name,
             uid_email: req.uid_email,
@@ -446,10 +548,130 @@ impl SigningService {
             key_id: Some(key_id),
             public_key_pem: public_key_armored,
             can_sign: false,
+            external_key_ref: None,
+            signing_provider: "local".to_string(),
             algorithm,
             uid_name: req.uid_name,
             uid_email: req.uid_email,
             expires_at: req.expires_at,
+            is_active: true,
+            created_at: now,
+            last_used_at: None,
+        })
+    }
+
+    /// Register an external/HSM signing key reference (public key + external ref).
+    ///
+    /// Stores the public key with `private_key_enc = NULL` and
+    /// `external_key_ref` set. `can_sign` is true because the external provider
+    /// can sign; in-process signing requires `AK_EXTERNAL_SIGN_COMMAND` or a
+    /// local private key.
+    pub async fn register_external_signing_key(
+        &self,
+        req: ImportExternalKeyRequest,
+    ) -> Result<SigningKeyPublic> {
+        let public_key_armored = req.public_key_pem.trim().to_string();
+        if public_key_armored.is_empty() {
+            return Err(AppError::Validation(
+                "Public key cannot be empty".to_string(),
+            ));
+        }
+
+        let name = req.name.trim().to_string();
+        if name.is_empty() {
+            return Err(AppError::Validation("Name cannot be empty".to_string()));
+        }
+
+        let external_key_ref = req.external_key_ref.trim().to_string();
+        if external_key_ref.is_empty() {
+            return Err(AppError::Validation(
+                "external_key_ref cannot be empty".to_string(),
+            ));
+        }
+
+        let public_key = parse_openpgp_public_key(&public_key_armored)?;
+        let fingerprint = hex::encode(public_key.fingerprint().as_bytes());
+        let key_id = hex::encode(public_key.key_id().as_ref());
+
+        let existing: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM signing_keys WHERE fingerprint = $1")
+                .bind(&fingerprint)
+                .fetch_optional(&self.db)
+                .await?;
+
+        if let Some((existing_id,)) = existing {
+            return Err(AppError::Conflict(format!(
+                "A signing key with fingerprint {} already exists (id: {})",
+                fingerprint, existing_id
+            )));
+        }
+
+        let key_type = normalize_key_type(req.key_type.as_deref().unwrap_or("gpg"))
+            .map_err(AppError::Validation)?
+            .to_string();
+        let signing_provider = req
+            .signing_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hsm")
+            .to_string();
+        // Algorithm carries a provider hint (`external` / `hsm`) so operators
+        // can distinguish these rows from local keypairs and public-only anchors.
+        let algorithm = req
+            .algorithm
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("external")
+            .to_string();
+
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO signing_keys (id, repository_id, name, key_type, fingerprint, key_id,
+                public_key_pem, private_key_enc, external_key_ref, signing_provider,
+                algorithm, uid_name, uid_email, is_active, created_at, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, true, $13, $14)
+            "#,
+        )
+        .bind(id)
+        .bind(req.repository_id)
+        .bind(&name)
+        .bind(&key_type)
+        .bind(&fingerprint)
+        .bind(&key_id)
+        .bind(&public_key_armored)
+        .bind(&external_key_ref)
+        .bind(&signing_provider)
+        .bind(&algorithm)
+        .bind(&req.uid_name)
+        .bind(&req.uid_email)
+        .bind(now)
+        .bind(req.created_by)
+        .execute(&self.db)
+        .await?;
+
+        self.audit_key_action(id, "registered_external", req.created_by, None)
+            .await?;
+
+        Ok(SigningKeyPublic {
+            id,
+            repository_id: req.repository_id,
+            name,
+            key_type,
+            fingerprint: Some(fingerprint),
+            key_id: Some(key_id),
+            public_key_pem: public_key_armored,
+            can_sign: true,
+            external_key_ref: Some(external_key_ref),
+            signing_provider,
+            algorithm,
+            uid_name: req.uid_name,
+            uid_email: req.uid_email,
+            expires_at: None,
             is_active: true,
             created_at: now,
             last_used_at: None,
@@ -505,30 +727,28 @@ impl SigningService {
 
     /// Get a signing key by ID (public info only).
     pub async fn get_key(&self, key_id: Uuid) -> Result<SigningKeyPublic> {
-        let key = sqlx::query_as!(
-            SigningKey,
-            "SELECT * FROM signing_keys WHERE id = $1",
-            key_id,
-        )
-        .fetch_optional(&self.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
+        // Non-macro query_as: SigningKey gained external_key_ref / signing_provider
+        // columns; keep offline builds working without regenerating .sqlx for SELECT *.
+        let key = sqlx::query_as::<_, SigningKey>("SELECT * FROM signing_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
 
         Ok(key.into())
     }
 
     /// Get the active signing key for a repository.
     pub async fn get_active_key_for_repo(&self, repo_id: Uuid) -> Result<Option<SigningKey>> {
-        let key = sqlx::query_as!(
-            SigningKey,
+        let key = sqlx::query_as::<_, SigningKey>(
             r#"
             SELECT sk.* FROM signing_keys sk
             JOIN repository_signing_config rsc ON rsc.signing_key_id = sk.id
             WHERE rsc.repository_id = $1 AND sk.is_active = true AND rsc.sign_metadata = true
             LIMIT 1
             "#,
-            repo_id,
         )
+        .bind(repo_id)
         .fetch_optional(&self.db)
         .await?;
 
@@ -538,20 +758,16 @@ impl SigningService {
     /// List signing keys, optionally filtered by repository.
     pub async fn list_keys(&self, repo_id: Option<Uuid>) -> Result<Vec<SigningKeyPublic>> {
         let keys = if let Some(rid) = repo_id {
-            sqlx::query_as!(
-                SigningKey,
+            sqlx::query_as::<_, SigningKey>(
                 "SELECT * FROM signing_keys WHERE repository_id = $1 ORDER BY created_at DESC",
-                rid,
             )
+            .bind(rid)
             .fetch_all(&self.db)
             .await?
         } else {
-            sqlx::query_as!(
-                SigningKey,
-                "SELECT * FROM signing_keys ORDER BY created_at DESC",
-            )
-            .fetch_all(&self.db)
-            .await?
+            sqlx::query_as::<_, SigningKey>("SELECT * FROM signing_keys ORDER BY created_at DESC")
+                .fetch_all(&self.db)
+                .await?
         };
 
         Ok(keys.into_iter().map(|k| k.into()).collect())
@@ -708,6 +924,37 @@ impl SigningService {
         Ok(secret_key)
     }
 
+    /// Attempt external/HSM signing via `AK_EXTERNAL_SIGN_COMMAND` when the key
+    /// has no local private material. Returns `Ok(None)` when the key has local
+    /// private material (caller should sign in-process). Returns `Err` when the
+    /// key is external-only and no command is configured / the command fails.
+    async fn try_external_sign(&self, key: &SigningKey, input: Vec<u8>) -> Result<Option<String>> {
+        if key.private_key_enc.is_some() {
+            return Ok(None);
+        }
+        if key.external_key_ref.is_none() {
+            return Err(AppError::Validation(
+                "Cannot sign with a public-only trust anchor (no private key)".to_string(),
+            ));
+        }
+        // External/HSM keys: in-process OpenPGP signing needs local private
+        // material. Optionally delegate to AK_EXTERNAL_SIGN_COMMAND (stdin =
+        // payload, stdout = armored signature). No shell — program + args only.
+        let Some(raw) = std::env::var("AK_EXTERNAL_SIGN_COMMAND").ok() else {
+            return Err(external_key_in_process_error());
+        };
+        let Some((program, args)) = parse_external_sign_command(&raw) else {
+            return Err(AppError::Validation(
+                "AK_EXTERNAL_SIGN_COMMAND is set but empty or invalid".to_string(),
+            ));
+        };
+        let armored = run_blocking("external_sign", move || {
+            sign_via_external_command_blocking(program, args, input)
+        })
+        .await?;
+        Ok(Some(armored))
+    }
+
     /// Sign `data` with `key` and return an ASCII-armored detached OpenPGP
     /// signature. Exposed publicly (in addition to `sign_openpgp_detached`)
     /// so callers that already hold the active `SigningKey` — e.g. handlers
@@ -718,6 +965,9 @@ impl SigningService {
         key: &SigningKey,
         data: &[u8],
     ) -> Result<String> {
+        if let Some(armored) = self.try_external_sign(key, data.to_vec()).await? {
+            return Ok(armored);
+        }
         // Decrypt + parse on the runtime: cheap relative to the signing work
         // itself, and lets us avoid cloning the encryption state across the
         // spawn_blocking boundary.
@@ -737,6 +987,9 @@ impl SigningService {
         key: &SigningKey,
         text: &str,
     ) -> Result<String> {
+        if let Some(armored) = self.try_external_sign(key, text.as_bytes().to_vec()).await? {
+            return Ok(armored);
+        }
         let secret_key = self.load_openpgp_secret_key(key)?;
         let text_owned = text.to_string();
         run_blocking("openpgp_sign_cleartext", move || {
@@ -871,18 +1124,15 @@ impl SigningService {
         old_key_id: Uuid,
         user_id: Option<Uuid>,
     ) -> Result<SigningKeyPublic> {
-        let old_key = sqlx::query_as!(
-            SigningKey,
-            "SELECT * FROM signing_keys WHERE id = $1",
-            old_key_id,
-        )
-        .fetch_optional(&self.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
+        let old_key = sqlx::query_as::<_, SigningKey>("SELECT * FROM signing_keys WHERE id = $1")
+            .bind(old_key_id)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Signing key not found".to_string()))?;
 
         if old_key.private_key_enc.is_none() {
             return Err(AppError::Validation(
-                "Cannot rotate a public-only trust anchor; import a new public key instead"
+                "Cannot rotate a public-only or external/HSM key; create or register a new key instead"
                     .to_string(),
             ));
         }
@@ -1000,6 +1250,8 @@ mod tests {
             key_id: Some(key_id),
             public_key_pem: public_pem,
             private_key_enc: Some(private_enc),
+            external_key_ref: None,
+            signing_provider: "local".to_string(),
             algorithm: "rsa2048".to_string(),
             uid_name: None,
             uid_email: None,
@@ -1038,6 +1290,8 @@ mod tests {
             key_id: Some(key_id),
             public_key_pem,
             private_key_enc: Some(service.encryption.encrypt(private_key_material.as_bytes())),
+            external_key_ref: None,
+            signing_provider: "local".to_string(),
             algorithm: req.algorithm,
             uid_name: req.uid_name,
             uid_email: req.uid_email,
@@ -1231,6 +1485,7 @@ mod tests {
     async fn test_public_only_trust_anchor_cannot_sign() {
         let mut key = generate_test_signing_key("public-only");
         key.private_key_enc = None;
+        key.external_key_ref = None;
         key.key_type = "gpg".to_string();
         key.algorithm = "public-only".to_string();
 
@@ -1251,6 +1506,45 @@ mod tests {
             err.to_string().contains("public-only trust anchor"),
             "expected public-only refusal, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_external_key_refuses_in_process_sign_without_command() {
+        let mut key = generate_test_signing_key("external");
+        key.private_key_enc = None;
+        key.external_key_ref = Some("pkcs11:object=release".to_string());
+        key.signing_provider = "hsm".to_string();
+        key.key_type = "gpg".to_string();
+        key.algorithm = "external".to_string();
+
+        let public: SigningKeyPublic = key.clone().into();
+        assert!(public.can_sign);
+
+        // Ensure the env var is unset for this assertion.
+        std::env::remove_var("AK_EXTERNAL_SIGN_COMMAND");
+
+        let service = SigningService {
+            db: PgPool::connect_lazy("postgresql://example.invalid/test").unwrap(),
+            encryption: CredentialEncryption::from_passphrase("external"),
+        };
+        let err = service
+            .sign_openpgp_detached_with_key(&key, b"Release\n")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("external/HSM")
+                || err.to_string().contains("In-process signing"),
+            "expected external-key refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_external_sign_command() {
+        assert!(parse_external_sign_command("").is_none());
+        assert!(parse_external_sign_command("   ").is_none());
+        let (prog, args) = parse_external_sign_command("/usr/bin/ak-hsm-sign --armor").unwrap();
+        assert_eq!(prog, "/usr/bin/ak-hsm-sign");
+        assert_eq!(args, vec!["--armor".to_string()]);
     }
 
     #[test]

@@ -17,9 +17,13 @@ pub struct SigningKey {
     pub key_id: Option<String>,
     pub public_key_pem: String,
     /// Encrypted private key material. `None` for public-only trust anchors
-    /// that can verify upstream signatures but cannot sign.
+    /// and external/HSM keys whose private material lives outside the process.
     #[serde(skip_serializing)]
     pub private_key_enc: Option<Vec<u8>>,
+    /// HSM key URI / PKCS#11 label / KMS ARN when signing is delegated externally.
+    pub external_key_ref: Option<String>,
+    /// Signing backend identifier (`local`, `hsm`, `kms`, `pkcs11`, …).
+    pub signing_provider: String,
     pub algorithm: String,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
@@ -41,9 +45,14 @@ pub struct SigningKeyPublic {
     pub fingerprint: Option<String>,
     pub key_id: Option<String>,
     pub public_key_pem: String,
-    /// True when this key can sign (has private material). False for
-    /// public-only trust anchors used only for upstream verification.
+    /// True when this key can sign (has local private material or an external
+    /// key reference). False for public-only trust anchors used only for
+    /// upstream verification.
     pub can_sign: bool,
+    /// Present when signing is delegated to an HSM/KMS/external provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_key_ref: Option<String>,
+    pub signing_provider: String,
     pub algorithm: String,
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
@@ -63,7 +72,9 @@ impl From<SigningKey> for SigningKeyPublic {
             fingerprint: k.fingerprint,
             key_id: k.key_id,
             public_key_pem: k.public_key_pem,
-            can_sign: k.private_key_enc.is_some(),
+            can_sign: k.private_key_enc.is_some() || k.external_key_ref.is_some(),
+            external_key_ref: k.external_key_ref,
+            signing_provider: k.signing_provider,
             algorithm: k.algorithm,
             uid_name: k.uid_name,
             uid_email: k.uid_email,
@@ -92,21 +103,19 @@ pub struct RepositorySigningConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_signing_key_public_from_signing_key() {
+    fn base_key(private_key_enc: Option<Vec<u8>>, external_key_ref: Option<String>) -> SigningKey {
         let now = chrono::Utc::now();
-        let key_id = Uuid::new_v4();
-        let repo_id = Uuid::new_v4();
-
-        let key = SigningKey {
-            id: key_id,
-            repository_id: Some(repo_id),
+        SigningKey {
+            id: Uuid::new_v4(),
+            repository_id: Some(Uuid::new_v4()),
             name: "my-gpg-key".to_string(),
             key_type: "gpg".to_string(),
             fingerprint: Some("ABCDEF1234567890".to_string()),
             key_id: Some("12345678".to_string()),
             public_key_pem: "-----BEGIN PGP PUBLIC KEY BLOCK-----...".to_string(),
-            private_key_enc: Some(vec![1, 2, 3, 4, 5]),
+            private_key_enc,
+            external_key_ref,
+            signing_provider: "local".to_string(),
             algorithm: "RSA".to_string(),
             uid_name: Some("Test User".to_string()),
             uid_email: Some("test@example.com".to_string()),
@@ -116,24 +125,32 @@ mod tests {
             created_by: None,
             rotated_from: None,
             last_used_at: Some(now),
-        };
+        }
+    }
+
+    #[test]
+    fn test_signing_key_public_from_signing_key() {
+        let key = base_key(Some(vec![1, 2, 3, 4, 5]), None);
+        let key_id = key.id;
+        let repo_id = key.repository_id;
 
         let public: SigningKeyPublic = key.into();
 
         assert_eq!(public.id, key_id);
-        assert_eq!(public.repository_id, Some(repo_id));
+        assert_eq!(public.repository_id, repo_id);
         assert_eq!(public.name, "my-gpg-key");
         assert_eq!(public.key_type, "gpg");
         assert_eq!(public.fingerprint.as_deref(), Some("ABCDEF1234567890"));
         assert_eq!(public.key_id.as_deref(), Some("12345678"));
         assert!(public.public_key_pem.contains("BEGIN PGP"));
         assert!(public.can_sign);
+        assert_eq!(public.signing_provider, "local");
+        assert!(public.external_key_ref.is_none());
         assert_eq!(public.algorithm, "RSA");
         assert_eq!(public.uid_name.as_deref(), Some("Test User"));
         assert_eq!(public.uid_email.as_deref(), Some("test@example.com"));
         assert!(public.is_active);
         assert!(public.last_used_at.is_some());
-        // Private key is NOT included in the public view
     }
 
     #[test]
@@ -148,6 +165,8 @@ mod tests {
             key_id: None,
             public_key_pem: "PEM".to_string(),
             private_key_enc: None,
+            external_key_ref: None,
+            signing_provider: "local".to_string(),
             algorithm: "Ed25519".to_string(),
             uid_name: None,
             uid_email: None,
@@ -168,5 +187,24 @@ mod tests {
         assert!(public.uid_email.is_none());
         assert!(!public.is_active);
         assert!(public.last_used_at.is_none());
+    }
+
+    #[test]
+    fn test_external_key_ref_can_sign_without_private_material() {
+        let key = base_key(
+            None,
+            Some("pkcs11:token=ak;object=release-key".to_string()),
+        );
+        let mut key = key;
+        key.signing_provider = "hsm".to_string();
+        key.algorithm = "external".to_string();
+
+        let public: SigningKeyPublic = key.into();
+        assert!(public.can_sign);
+        assert_eq!(
+            public.external_key_ref.as_deref(),
+            Some("pkcs11:token=ak;object=release-key")
+        );
+        assert_eq!(public.signing_provider, "hsm");
     }
 }

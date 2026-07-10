@@ -40,10 +40,11 @@ use crate::api::handlers::repositories::DebianRepositoryConfig;
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::formats::debian::{
-    build_debian_sync_plan, filter_release_package_indexes, filter_release_source_indexes,
-    parse_packages_index, parse_release, parse_sources_index, validate_release_filter_selection,
-    DebControl, DebianHandler, DebianSyncDownloadPolicy, DebianSyncFilter, DebianSyncPlan,
-    PackagesEntry, SourceFileEntry, SourcesEntry,
+    build_contents_index, build_debian_sync_plan, by_hash_path, filter_release_package_indexes,
+    filter_release_source_indexes, is_flat_repository_package_path, parse_packages_index,
+    parse_release, parse_sources_index, pool_path_allowed_by_filters, validate_debian_fetch_path,
+    validate_release_filter_selection, DebControl, DebianHandler, DebianSyncDownloadPolicy,
+    DebianSyncFilter, DebianSyncPlan, PackagesEntry, SourceFileEntry, SourcesEntry,
 };
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::signing_key::SigningKey;
@@ -98,6 +99,11 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/pool/:component/*path",
             get(pool_download).put(pool_upload),
+        )
+        // Flat / root-relative package paths (after pool so pool wins for pool/...)
+        .route(
+            "/:repo_key/*artifact_path",
+            get(flat_or_root_package_download),
         )
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_raw))
@@ -680,41 +686,10 @@ async fn generate_release_content(
     let (components, architectures) =
         effective_release_layout(config.as_ref(), components, architectures);
 
-    let mut release_files = Vec::new();
-    for component in &components {
-        for arch in &architectures {
-            let entries =
-                fetch_package_entries(&state.db, repo_id, distribution, component, arch).await?;
-            let packages_text = build_packages_text(&entries);
-            let packages_bytes = packages_text.into_bytes();
-            let packages_path = format!("{}/binary-{}/Packages", component, arch);
-            release_files.push((packages_path, packages_bytes.clone()));
-
-            let gz_bytes = gzip_compress(&packages_bytes).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Compression error: {}", e),
-                )
-                    .into_response()
-            })?;
-            release_files.push((
-                format!("{}/binary-{}/Packages.gz", component, arch),
-                gz_bytes,
-            ));
-
-            let xz_bytes = xz_compress(&packages_bytes).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("XZ compression error: {}", e),
-                )
-                    .into_response()
-            })?;
-            release_files.push((
-                format!("{}/binary-{}/Packages.xz", component, arch),
-                xz_bytes,
-            ));
-        }
-    }
+    let mut release_files =
+        build_hosted_release_files(state, repo_id, distribution, &components, &architectures)
+            .await?;
+    append_by_hash_release_files(&mut release_files);
 
     Ok(build_release_content_from_files(
         distribution,
@@ -724,6 +699,81 @@ async fn generate_release_content(
         &architectures,
         release_files,
     ))
+}
+
+/// Build Packages + Contents index blobs for a hosted repository generation.
+async fn build_hosted_release_files(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+    components: &BTreeSet<String>,
+    architectures: &BTreeSet<String>,
+) -> Result<Vec<(String, Vec<u8>)>, Response> {
+    let mut release_files = Vec::new();
+    for component in components {
+        for arch in architectures {
+            let entries =
+                fetch_package_entries(&state.db, repo_id, distribution, component, arch).await?;
+            let packages_text = build_packages_text(&entries);
+            let packages_bytes = packages_text.into_bytes();
+            let packages_path = format!("{}/binary-{}/Packages", component, arch);
+            push_index_variants(&mut release_files, &packages_path, &packages_bytes)?;
+
+            let contents_entries: Vec<(String, String)> = entries
+                .iter()
+                .map(|entry| (entry.filename.clone(), entry.control.package.clone()))
+                .collect();
+            let contents_text = build_contents_index(&contents_entries);
+            let contents_bytes = contents_text.into_bytes();
+            let contents_path = format!("{}/Contents-{}", component, arch);
+            push_index_variants(&mut release_files, &contents_path, &contents_bytes)?;
+        }
+    }
+    Ok(release_files)
+}
+
+#[allow(clippy::result_large_err)]
+fn push_index_variants(
+    release_files: &mut Vec<(String, Vec<u8>)>,
+    plain_path: &str,
+    plain_bytes: &[u8],
+) -> Result<(), Response> {
+    release_files.push((plain_path.to_string(), plain_bytes.to_vec()));
+
+    let gz_bytes = gzip_compress(plain_bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Compression error: {}", e),
+        )
+            .into_response()
+    })?;
+    release_files.push((format!("{plain_path}.gz"), gz_bytes));
+
+    let xz_bytes = xz_compress(plain_bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("XZ compression error: {}", e),
+        )
+            .into_response()
+    })?;
+    release_files.push((format!("{plain_path}.xz"), xz_bytes));
+    Ok(())
+}
+
+/// Append `by-hash/SHA256/<digest>` aliases for every non-by-hash release file.
+fn append_by_hash_release_files(release_files: &mut Vec<(String, Vec<u8>)>) {
+    let snapshot: Vec<(String, Vec<u8>)> = release_files
+        .iter()
+        .filter(|(path, _)| !path.starts_with("by-hash/"))
+        .cloned()
+        .collect();
+    for (_path, bytes) in snapshot {
+        let sha = calculate_sha256_hex(&bytes);
+        let bh = by_hash_path("SHA256", &sha);
+        if !release_files.iter().any(|(path, _)| path == &bh) {
+            release_files.push((bh, bytes));
+        }
+    }
 }
 
 async fn discover_release_layout(
@@ -1423,6 +1473,7 @@ fn proxy_err_status_and_message(e: &crate::error::AppError) -> (StatusCode, Stri
 
 /// Generate the Release content locally (shared by Release, InRelease,
 /// and Release.gpg handlers). Returns the text and the repo for signing.
+#[allow(clippy::result_large_err)]
 async fn local_release_content(
     state: &SharedState,
     repo_key: &str,
@@ -1595,6 +1646,43 @@ fn build_synced_dists_index_response(path: &str, text: String) -> Result<Respons
         .header(CONTENT_LENGTH, body.len().to_string())
         .body(Body::from(body))
         .unwrap())
+}
+
+/// Load synced dists content, resolving `@ref:` by-hash aliases to the
+/// referenced logical index path and returning `(serve_path, plain_text)`.
+async fn load_synced_dists_content_resolved(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+    path: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let Some(text) = load_synced_dists_content(state, repo_id, distribution, path).await? else {
+        return Ok(None);
+    };
+    if let Some(ref_path) = text.strip_prefix("@ref:") {
+        let plain_path = canonical_plain_dists_index_path(ref_path);
+        let Some(plain) =
+            load_synced_dists_content(state, repo_id, distribution, plain_path).await?
+        else {
+            return Ok(None);
+        };
+        return Ok(Some((ref_path.to_string(), plain)));
+    }
+    Ok(Some((path.to_string(), text)))
+}
+
+async fn try_synced_dists_response(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+    path: &str,
+) -> Result<Option<Response>, Response> {
+    let Some((serve_path, text)) =
+        load_synced_dists_content_resolved(state, repo_id, distribution, path).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(build_synced_dists_index_response(&serve_path, text)?))
 }
 async fn flat_release_file(
     State(state): State<SharedState>,
@@ -1905,6 +1993,33 @@ fn build_synced_generated_metadata(
         let text =
             build_generated_packages_text(entries, &index.architecture, selected_architectures);
         add_generated_dists_index(&mut generated, &index.path, text)?;
+
+        let contents_path = format!("{}/Contents-{}", index.component, index.architecture);
+        if !generated.plain_indexes.contains_key(&contents_path) {
+            let contents_entries: Vec<(String, String)> = entries
+                .iter()
+                .filter(|entry| {
+                    package_matches_generated_index(
+                        &entry.control.architecture,
+                        &index.architecture,
+                        selected_architectures,
+                    )
+                })
+                .filter_map(|entry| {
+                    let filename = entry
+                        .filename
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())?;
+                    Some((filename.to_string(), entry.control.package.clone()))
+                })
+                .collect();
+            add_generated_dists_index(
+                &mut generated,
+                &contents_path,
+                build_contents_index(&contents_entries),
+            )?;
+        }
     }
 
     for index in &plan.source_indexes {
@@ -1929,15 +2044,24 @@ fn add_generated_dists_index(
     }
 
     let plain_bytes = text.as_bytes().to_vec();
-    generated
-        .release_files
-        .push((base_path.clone(), plain_bytes.clone()));
-    generated
-        .release_files
-        .push((format!("{base_path}.gz"), gzip_compress(&plain_bytes)?));
-    generated
-        .release_files
-        .push((format!("{base_path}.xz"), xz_compress(&plain_bytes)?));
+    let gz_bytes = gzip_compress(&plain_bytes)?;
+    let xz_bytes = xz_compress(&plain_bytes)?;
+    let variants = [
+        (base_path.clone(), plain_bytes),
+        (format!("{base_path}.gz"), gz_bytes),
+        (format!("{base_path}.xz"), xz_bytes),
+    ];
+    for (path, bytes) in variants {
+        let sha = calculate_sha256_hex(&bytes);
+        let bh = by_hash_path("SHA256", &sha);
+        generated.release_files.push((path.clone(), bytes.clone()));
+        generated.release_files.push((bh.clone(), bytes));
+        // Alias so by-hash fetches resolve to the logical index path and
+        // recompress deterministically from the stored plain text.
+        generated
+            .plain_indexes
+            .insert(bh, format!("@ref:{path}"));
+    }
     generated.plain_indexes.insert(base_path, text);
     Ok(())
 }
@@ -1952,10 +2076,10 @@ async fn packages_index(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_suffix = packages_index_suffix(&component, &binary_arch, "");
-    if let Some(text) =
-        load_synced_dists_content(&state, repo.id, &distribution, &packages_suffix).await?
+    if let Some(response) =
+        try_synced_dists_response(&state, repo.id, &distribution, &packages_suffix).await?
     {
-        return build_synced_dists_index_response(&packages_suffix, text);
+        return Ok(response);
     }
     proxy
         .dists(&packages_suffix, "text/plain; charset=utf-8", &repo)
@@ -1985,10 +2109,10 @@ async fn packages_index_gz(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_gz_suffix = packages_index_suffix(&component, &binary_arch, "gz");
-    if let Some(text) =
-        load_synced_dists_content(&state, repo.id, &distribution, &packages_gz_suffix).await?
+    if let Some(response) =
+        try_synced_dists_response(&state, repo.id, &distribution, &packages_gz_suffix).await?
     {
-        return build_synced_dists_index_response(&packages_gz_suffix, text);
+        return Ok(response);
     }
     proxy
         .dists(&packages_gz_suffix, "application/gzip", &repo)
@@ -2026,10 +2150,10 @@ async fn packages_index_xz(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_xz_suffix = packages_index_suffix(&component, &binary_arch, "xz");
-    if let Some(text) =
-        load_synced_dists_content(&state, repo.id, &distribution, &packages_xz_suffix).await?
+    if let Some(response) =
+        try_synced_dists_response(&state, repo.id, &distribution, &packages_xz_suffix).await?
     {
-        return build_synced_dists_index_response(&packages_xz_suffix, text);
+        return Ok(response);
     }
     proxy
         .dists(&packages_xz_suffix, "application/x-xz", &repo)
@@ -2095,10 +2219,43 @@ fn parse_packages_request(dists_path: &str) -> Option<PackagesRequest> {
     })
 }
 
+struct ContentsRequest {
+    component: String,
+    arch: String,
+    ext: PackagesExt,
+}
+
+/// Recognise `{component}/Contents-{arch}{,.gz,.xz}`.
+fn parse_contents_request(dists_path: &str) -> Option<ContentsRequest> {
+    let segments: Vec<&str> = dists_path.split('/').collect();
+    if segments.len() != 2 {
+        return None;
+    }
+    let rest = segments[1].strip_prefix("Contents-")?;
+    let (arch, ext) = if let Some(arch) = rest.strip_suffix(".gz") {
+        (arch, PackagesExt::Gz)
+    } else if let Some(arch) = rest.strip_suffix(".xz") {
+        (arch, PackagesExt::Xz)
+    } else if rest.contains('.') {
+        return None;
+    } else {
+        (rest, PackagesExt::Plain)
+    };
+    if arch.is_empty() {
+        return None;
+    }
+    Some(ContentsRequest {
+        component: segments[0].to_string(),
+        arch: arch.to_string(),
+        ext,
+    })
+}
+
 /// Single entry point for all `dists/{distribution}/...` requests after
 /// the static Release/InRelease/Release.gpg/gpg-key.asc routes. Dispatches
-/// `{component}/binary-{arch}/Packages{,.gz,.xz}` to the matching Packages
-/// handler and forwards everything else to the upstream proxy catch-all.
+/// `{component}/binary-{arch}/Packages{,.gz,.xz}` and
+/// `{component}/Contents-{arch}{,.gz,.xz}` to the matching handlers and
+/// forwards everything else to the upstream proxy catch-all.
 async fn dists_dispatch(
     state: State<SharedState>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
@@ -2111,7 +2268,120 @@ async fn dists_dispatch(
             PackagesExt::Xz => packages_index_xz(state, path).await,
         };
     }
+    if let Some(req) = parse_contents_request(&dists_path) {
+        return contents_index(state, repo_key, distribution, req).await;
+    }
     dists_proxy_catchall(state, Path((repo_key, distribution, dists_path))).await
+}
+
+async fn contents_index(
+    State(state): State<SharedState>,
+    repo_key: String,
+    distribution: String,
+    req: ContentsRequest,
+) -> Result<Response, Response> {
+    let contents_suffix = match req.ext {
+        PackagesExt::Plain => format!("{}/Contents-{}", req.component, req.arch),
+        PackagesExt::Gz => format!("{}/Contents-{}.gz", req.component, req.arch),
+        PackagesExt::Xz => format!("{}/Contents-{}.xz", req.component, req.arch),
+    };
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    if let Some(response) =
+        try_synced_dists_response(&state, repo.id, &distribution, &contents_suffix).await?
+    {
+        return Ok(response);
+    }
+
+    // Remote: fall through to catch-all proxy for upstream Contents.
+    if repo.repo_type == RepositoryType::Remote || repo.repo_type == RepositoryType::Virtual {
+        return dists_proxy_catchall(
+            State(state),
+            Path((repo_key, distribution, contents_suffix)),
+        )
+        .await;
+    }
+
+    // Hosted: generate a minimal Contents index from package filenames.
+    let entries =
+        fetch_package_entries(&state.db, repo.id, &distribution, &req.component, &req.arch)
+            .await?;
+    let contents_entries: Vec<(String, String)> = entries
+        .iter()
+        .map(|entry| (entry.filename.clone(), entry.control.package.clone()))
+        .collect();
+    let text = build_contents_index(&contents_entries);
+    match req.ext {
+        PackagesExt::Plain => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(CONTENT_LENGTH, text.len().to_string())
+            .body(Body::from(text))
+            .unwrap()),
+        PackagesExt::Gz => {
+            let compressed = gzip_compress(text.as_bytes()).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Compression error: {}", e),
+                )
+                    .into_response()
+            })?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/gzip")
+                .header(CONTENT_LENGTH, compressed.len().to_string())
+                .body(Body::from(compressed))
+                .unwrap())
+        }
+        PackagesExt::Xz => {
+            let compressed = xz_compress(text.as_bytes()).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("XZ compression error: {}", e),
+                )
+                    .into_response()
+            })?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/x-xz")
+                .header(CONTENT_LENGTH, compressed.len().to_string())
+                .body(Body::from(compressed))
+                .unwrap())
+        }
+    }
+}
+
+/// Serve hosted Contents / by-hash paths from on-demand Release generation.
+async fn try_hosted_generated_dists_path(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+    dists_path: &str,
+) -> Result<Option<Response>, Response> {
+    if !(dists_path.starts_with("by-hash/") || parse_contents_request(dists_path).is_some()) {
+        return Ok(None);
+    }
+    let config = load_debian_repository_config(&state.db, repo_id).await;
+    let (components, architectures) = discover_release_layout(&state.db, repo_id).await?;
+    let (components, architectures) =
+        effective_release_layout(config.as_ref(), components, architectures);
+    let mut release_files =
+        build_hosted_release_files(state, repo_id, distribution, &components, &architectures)
+            .await?;
+    append_by_hash_release_files(&mut release_files);
+    let Some((_, bytes)) = release_files
+        .into_iter()
+        .find(|(path, _)| path == dists_path)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type_for_dists_path(dists_path))
+            .header(CONTENT_LENGTH, bytes.len().to_string())
+            .body(Body::from(bytes))
+            .unwrap(),
+    ))
 }
 
 /// Catch-all handler for dists metadata that does not have a dedicated route.
@@ -2128,10 +2398,10 @@ async fn dists_proxy_catchall(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    if let Some(text) =
-        load_synced_dists_content(&state, repo.id, &distribution, &dists_path).await?
+    if let Some(response) =
+        try_synced_dists_response(&state, repo.id, &distribution, &dists_path).await?
     {
-        return build_synced_dists_index_response(&dists_path, text);
+        return Ok(response);
     }
 
     // Once a local generation is published, ancillary metadata that is not part
@@ -2159,6 +2429,12 @@ async fn dists_proxy_catchall(
     }
 
     if repo.repo_type != RepositoryType::Remote {
+        // Hosted: serve Contents / by-hash from on-demand generation.
+        if let Some(response) =
+            try_hosted_generated_dists_path(&state, repo.id, &distribution, &dists_path).await?
+        {
+            return Ok(response);
+        }
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
@@ -2225,6 +2501,201 @@ fn xz_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
 // GET /debian/{repo_key}/pool/{component}/*path -- Download .deb
 // ---------------------------------------------------------------------------
 
+/// Extract SHA256 for a Filename from Packages index text.
+fn sha256_for_filename_in_packages_text(text: &str, filename: &str) -> Option<String> {
+    let filename = filename.trim().trim_start_matches('/');
+    if filename.is_empty() {
+        return None;
+    }
+    let entries = parse_packages_index("Packages", text.as_bytes()).ok()?;
+    for entry in entries {
+        let Some(entry_filename) = entry
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .map(|value| value.trim_start_matches('/'))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if entry_filename == filename || entry_filename.ends_with(filename) || filename.ends_with(entry_filename)
+        {
+            if let Some(sha256) = entry
+                .sha256
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(sha256.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+async fn lookup_synced_package_sha256(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    pool_path: &str,
+) -> Option<String> {
+    let values: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1
+          AND key LIKE 'debian_synced_dists:%'
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    .ok()?;
+
+    for text in values {
+        if text.starts_with("@ref:") {
+            continue;
+        }
+        if let Some(sha256) = sha256_for_filename_in_packages_text(&text, pool_path) {
+            return Some(sha256);
+        }
+    }
+    None
+}
+
+async fn debian_any_local_generation_active(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    config: Option<&DebianRepositoryConfig>,
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    for distribution in config.effective_distribution_paths() {
+        let normalized = distribution.trim_matches('/');
+        if debian_local_generation_active(state, repo_id, normalized).await {
+            return true;
+        }
+    }
+    // Flat repos store synced Release under an empty distribution key.
+    if config.flat_repository && debian_local_generation_active(state, repo_id, "").await {
+        return true;
+    }
+    false
+}
+
+fn debian_sync_filter_for_path_check(config: &DebianRepositoryConfig) -> DebianSyncFilter {
+    DebianSyncFilter {
+        distributions: Vec::new(),
+        components: config.effective_components(),
+        architectures: config.effective_architectures(),
+        include_source_packages: false,
+        package_queries: config.effective_package_queries(),
+        resolve_dependencies: false,
+    }
+}
+
+fn map_debian_fetch_path_error(error: crate::error::AppError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        error.to_string(),
+    )
+        .into_response()
+}
+
+/// Shared remote package fetch with filter / SSRF / digest gates.
+async fn proxy_remote_debian_package(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    upstream_url: &str,
+    upstream_path: &str,
+    component_for_filter: &str,
+    filename: &str,
+) -> Result<Response, Response> {
+    let proxy = state.proxy_service.as_deref().ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "Package not found").into_response()
+    })?;
+    let config = load_debian_repository_config(&state.db, repo.id).await;
+    let filter = config
+        .as_ref()
+        .map(debian_sync_filter_for_path_check)
+        .unwrap_or_default();
+
+    if !pool_path_allowed_by_filters(component_for_filter, filename, &filter) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Package not allowed by repository filters",
+        )
+            .into_response());
+    }
+
+    validate_debian_fetch_path(upstream_path).map_err(map_debian_fetch_path_error)?;
+
+    let verify_required = config
+        .as_ref()
+        .map(|c| c.verify_upstream_metadata)
+        .unwrap_or(false)
+        || debian_any_local_generation_active(state, repo.id, config.as_ref()).await;
+
+    let expected_sha = lookup_synced_package_sha256(state, repo.id, upstream_path).await;
+    if verify_required && expected_sha.is_none() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Refusing to serve unverified package: no SHA256 in synced metadata",
+        )
+            .into_response());
+    }
+
+    let passthrough = config
+        .as_ref()
+        .map(|c| {
+            c.package_fetch_strategy
+                == crate::api::handlers::repositories::DebianPackageFetchStrategy::Passthrough
+        })
+        .unwrap_or(false);
+
+    if passthrough {
+        if let Some(sha256) = expected_sha.clone() {
+            // Prefer digest-gated streaming when a known digest is available.
+            let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+                proxy,
+                repo.id,
+                repo_key,
+                upstream_url,
+                upstream_path,
+                upstream_path,
+                Some(sha256),
+            )
+            .await?;
+            return proxy_helpers::stream_fetch_result(
+                result,
+                DEBIAN_BINARY_CONTENT_TYPE,
+                Some(filename),
+            );
+        }
+        return proxy_helpers::proxy_fetch_streaming_uncached(
+            proxy,
+            repo.id,
+            repo_key,
+            upstream_url,
+            upstream_path,
+            DEBIAN_BINARY_CONTENT_TYPE,
+        )
+        .await;
+    }
+
+    let result = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        upstream_path,
+        upstream_path,
+        expected_sha,
+    )
+    .await?;
+    proxy_helpers::stream_fetch_result(result, DEBIAN_BINARY_CONTENT_TYPE, Some(filename))
+}
+
 async fn pool_download(
     State(state): State<SharedState>,
     Path((repo_key, component, path)): Path<(String, String, String)>,
@@ -2254,41 +2725,17 @@ async fn pool_download(
         Ok(a) => a,
         Err(not_found) => {
             if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
+                if let Some(ref upstream_url) = repo.upstream_url {
                     let upstream_path = format!("pool/{}/{}", component, path);
-                    let passthrough_packages = load_debian_repository_config(&state.db, repo.id)
-                        .await
-                        .map(|config| {
-                            config.package_fetch_strategy
-                                == crate::api::handlers::repositories::DebianPackageFetchStrategy::Passthrough
-                        })
-                        .unwrap_or(false);
-
-                    // #895: stream .deb bodies. Default Content-Type
-                    // matches the IANA registration for Debian packages
-                    // (apt clients don't care; the registration just
-                    // gives downstream proxies a meaningful Content-Type
-                    // when upstream omits it).
-                    if passthrough_packages {
-                        return proxy_helpers::proxy_fetch_streaming_uncached(
-                            proxy,
-                            repo.id,
-                            &repo_key,
-                            upstream_url,
-                            &upstream_path,
-                            DEBIAN_BINARY_CONTENT_TYPE,
-                        )
-                        .await;
-                    }
-                    return proxy_helpers::proxy_fetch_streaming(
-                        proxy,
-                        repo.id,
+                    let filename = path.rsplit('/').next().unwrap_or(&path);
+                    return proxy_remote_debian_package(
+                        &state,
+                        &repo,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
-                        DEBIAN_BINARY_CONTENT_TYPE,
+                        &component,
+                        filename,
                     )
                     .await;
                 }
@@ -2370,6 +2817,101 @@ async fn pool_download(
         .header("X-Checksum-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+/// GET /debian/{repo_key}/*artifact_path — flat-repository package download.
+async fn flat_or_root_package_download(
+    State(state): State<SharedState>,
+    Path((repo_key, artifact_path)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let config = load_debian_repository_config(&state.db, repo.id).await;
+    if !config
+        .as_ref()
+        .map(|c| c.flat_repository)
+        .unwrap_or(false)
+    {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+    if !is_flat_repository_package_path(&artifact_path) {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+    validate_debian_fetch_path(&artifact_path).map_err(map_debian_fetch_path_error)?;
+
+    let filename = artifact_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(artifact_path.as_str());
+
+    let artifact = sqlx::query!(
+        r#"
+        SELECT id, storage_key, size_bytes, checksum_sha256
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND path = $2
+        LIMIT 1
+        "#,
+        repo.id,
+        artifact_path
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(crate::api::handlers::db_err)?;
+
+    if let Some(artifact) = artifact {
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(|e| e.into_response())?;
+        crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+            .await
+            .map_err(|e| e.into_response())?;
+        let stream = storage
+            .get_stream(&artifact.storage_key)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Storage error: {}", e),
+                )
+                    .into_response()
+            })?;
+        let _ = sqlx::query!(
+            "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+            artifact.id
+        )
+        .execute(&state.db)
+        .await;
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, DEBIAN_BINARY_CONTENT_TYPE)
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+            .body(Body::from_stream(stream))
+            .unwrap());
+    }
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(ref upstream_url) = repo.upstream_url {
+            // Flat repos have empty component filters; pass "" so any component passes.
+            return proxy_remote_debian_package(
+                &state,
+                &repo,
+                &repo_key,
+                upstream_url,
+                &artifact_path,
+                "",
+                filename,
+            )
+            .await;
+        }
+    }
+
+    Err((StatusCode::NOT_FOUND, "Package not found").into_response())
 }
 
 struct DebianPackageUpload {
@@ -2494,6 +3036,15 @@ fn build_debian_artifact_metadata(
     package_type: &str,
     control: &DebControl,
 ) -> serde_json::Value {
+    let is_installer = component == "debian-installer"
+        || artifact_path.contains("/debian-installer/")
+        || component.contains("debian-installer");
+    let package_type = if is_installer { "udeb" } else { package_type };
+    let section = if is_installer {
+        Some("debian-installer".to_string())
+    } else {
+        control.section.clone()
+    };
     serde_json::json!({
         "format": "debian",
         "package": &control.package,
@@ -2515,7 +3066,7 @@ fn build_debian_artifact_metadata(
         "conflicts": &control.conflicts,
         "provides": &control.provides,
         "replaces": &control.replaces,
-        "section": &control.section,
+        "section": section,
         "priority": &control.priority,
         "homepage": &control.homepage,
         "source": &control.source,
@@ -2524,13 +3075,26 @@ fn build_debian_artifact_metadata(
 }
 
 fn build_debian_package_catalog_metadata(upload: &DebianPackageUpload) -> serde_json::Value {
+    let is_installer = upload.component == "debian-installer"
+        || upload.artifact_path.contains("/debian-installer/")
+        || upload.component.contains("debian-installer");
+    let package_type = if is_installer {
+        "udeb"
+    } else {
+        upload.deb_info.package_type.as_str()
+    };
+    let section = if is_installer {
+        Some("debian-installer")
+    } else {
+        upload.control.section.as_deref()
+    };
     serde_json::json!({
         "format": "debian",
         "architecture": &upload.control.architecture,
         "distribution": &upload.distribution,
         "component": &upload.component,
-        "package_type": &upload.deb_info.package_type,
-        "section": &upload.control.section,
+        "package_type": package_type,
+        "section": section,
         "priority": &upload.control.priority,
         "maintainer": &upload.control.maintainer,
         "homepage": &upload.control.homepage,
@@ -3018,8 +3582,8 @@ async fn sync_remote_repository(
         components: config.effective_components(),
         architectures: config.effective_architectures(),
         include_source_packages: config.include_source_packages,
-        package_queries: Vec::new(),
-        resolve_dependencies: false,
+        package_queries: config.effective_package_queries(),
+        resolve_dependencies: config.resolve_dependencies,
     };
     let download_policy = if config.package_fetch_strategy
         == crate::api::handlers::repositories::DebianPackageFetchStrategy::PrefetchSelected
@@ -3266,6 +3830,8 @@ async fn sync_remote_repository(
             if !prefetched.insert(package.filename.clone()) {
                 continue;
             }
+            validate_debian_fetch_path(&package.filename)
+                .map_err(|error| debian_sync_verification_error("package path", error))?;
             let expected = expected_prefetch_digest(
                 &package_digests,
                 &package.filename,
@@ -3290,6 +3856,8 @@ async fn sync_remote_repository(
             if !prefetched_sources.insert(source.filename.clone()) {
                 continue;
             }
+            validate_debian_fetch_path(&source.filename)
+                .map_err(|error| debian_sync_verification_error("source path", error))?;
             let expected = expected_prefetch_digest(
                 &source_digests,
                 &source.filename,
@@ -3326,16 +3894,95 @@ mod tests {
     fn test_pool_download_passthrough_package_strategy_uses_uncached_proxy() {
         let src = include_str!("debian.rs");
         let fn_start = src
-            .find("async fn pool_download(")
-            .expect("pool_download must exist");
+            .find("async fn proxy_remote_debian_package(")
+            .expect("proxy_remote_debian_package must exist");
         let remote_branch_end = src[fn_start..]
-            .find("// Virtual repo: try each member in priority order")
-            .expect("pool_download remote branch must precede virtual branch");
+            .find("async fn pool_download(")
+            .expect("pool_download must follow proxy helper");
         let remote_branch = &src[fn_start..fn_start + remote_branch_end];
 
         assert!(remote_branch.contains("DebianPackageFetchStrategy::Passthrough"));
         assert!(remote_branch.contains("proxy_fetch_streaming_uncached("));
-        assert!(remote_branch.contains("proxy_fetch_streaming("));
+        assert!(remote_branch.contains("proxy_fetch_streaming_with_cache_key_verified("));
+        assert!(remote_branch.contains("pool_path_allowed_by_filters("));
+        assert!(remote_branch.contains("validate_debian_fetch_path("));
+    }
+
+    #[test]
+    fn test_pool_download_wires_filter_and_ssrf_helpers() {
+        let src = include_str!("debian.rs");
+        let fn_start = src
+            .find("async fn pool_download(")
+            .expect("pool_download must exist");
+        let window = &src[fn_start..fn_start + 2500];
+        assert!(window.contains("proxy_remote_debian_package("));
+    }
+
+    #[test]
+    fn test_flat_package_route_registered() {
+        let src = include_str!("debian.rs");
+        let router = src
+            .find("pub fn router() -> Router<SharedState>")
+            .expect("router must exist");
+        let body = &src[router..router + 3500];
+        assert!(body.contains("/:repo_key/*artifact_path"));
+        assert!(body.contains("flat_or_root_package_download"));
+        let pool_pos = body
+            .find("/:repo_key/pool/:component/*path")
+            .expect("pool route");
+        let flat_pos = body
+            .find("/:repo_key/*artifact_path")
+            .expect("flat route");
+        assert!(
+            pool_pos < flat_pos,
+            "pool route must be registered before flat catch-all"
+        );
+    }
+
+    #[test]
+    fn test_local_release_content_has_clippy_allow() {
+        let src = include_str!("debian.rs");
+        let pos = src
+            .find("async fn local_release_content(")
+            .expect("local_release_content must exist");
+        let ahead = &src[pos.saturating_sub(120)..pos];
+        assert!(
+            ahead.contains("#[allow(clippy::result_large_err)]"),
+            "local_release_content must allow clippy::result_large_err"
+        );
+    }
+
+    #[test]
+    fn test_sha256_for_filename_in_packages_text() {
+        let text = "\
+Package: nginx
+Version: 1.0
+Architecture: amd64
+Filename: pool/main/n/nginx/nginx_1.0_amd64.deb
+SHA256: AbCdEf1234567890
+
+Package: curl
+Version: 2.0
+Architecture: amd64
+Filename: pool/main/c/curl/curl_2.0_amd64.deb
+SHA256: deadbeef
+";
+        assert_eq!(
+            sha256_for_filename_in_packages_text(
+                text,
+                "pool/main/n/nginx/nginx_1.0_amd64.deb"
+            )
+            .as_deref(),
+            Some("abcdef1234567890")
+        );
+        assert_eq!(
+            sha256_for_filename_in_packages_text(text, "nginx_1.0_amd64.deb").as_deref(),
+            Some("abcdef1234567890")
+        );
+        assert_eq!(
+            sha256_for_filename_in_packages_text(text, "pool/main/missing.deb"),
+            None
+        );
     }
     use super::*;
 
@@ -3533,10 +4180,21 @@ mod tests {
             !body.contains("proxy_helpers::proxy_fetch_streaming(\n"),
             "prefetch must not use the un-verified streaming helper"
         );
+        // Prefetch paths are SSRF-validated before fetch.
+        assert!(
+            body.contains("validate_debian_fetch_path(&package.filename)")
+                && body.contains("validate_debian_fetch_path(&source.filename)"),
+            "prefetch must validate package/source paths against SSRF"
+        );
         // Bug 5: generated metadata is published in a single transaction.
         assert!(
             body.contains(".begin()") && body.contains("tx.commit()"),
             "generated metadata must be published atomically in one transaction"
+        );
+        assert!(
+            body.contains("effective_package_queries()")
+                || body.contains("config.effective_package_queries()"),
+            "sync filter must wire package_queries from config"
         );
     }
 
@@ -3848,6 +4506,41 @@ mod tests {
     }
 
     #[test]
+    fn test_build_debian_artifact_metadata_installer_component() {
+        let control = DebControl {
+            package: "base-installer".to_string(),
+            version: "1.200".to_string(),
+            architecture: "amd64".to_string(),
+            maintainer: None,
+            installed_size: None,
+            depends: None,
+            pre_depends: None,
+            recommends: None,
+            suggests: None,
+            conflicts: None,
+            provides: None,
+            replaces: None,
+            section: Some("utils".to_string()),
+            priority: None,
+            homepage: None,
+            description: None,
+            source: None,
+            extra: Default::default(),
+        };
+        let meta = build_debian_artifact_metadata(
+            Some("bookworm"),
+            "debian-installer",
+            "pool/debian-installer/b/base-installer/base-installer_1.200_amd64.udeb",
+            "base-installer_1.200_amd64.udeb",
+            "udeb",
+            &control,
+        );
+        assert_eq!(meta["package_type"], "udeb");
+        assert_eq!(meta["section"], "debian-installer");
+        assert_eq!(meta["component"], "debian-installer");
+    }
+
+    #[test]
     fn test_parse_deb_filename_no_deb_extension() {
         assert!(parse_deb_filename("nginx_1.0_amd64.rpm").is_none());
     }
@@ -3961,9 +4654,9 @@ mod tests {
         let catchall = src
             .find("async fn dists_proxy_catchall(")
             .expect("catchall exists");
-        let body = &src[catchall..catchall + 1400];
+        let body = &src[catchall..catchall + 1800];
         let local = body
-            .find("load_synced_dists_content(")
+            .find("try_synced_dists_response(")
             .expect("catchall loads local content");
         let gate = body
             .find("reject_uncovered_generation_path(")
@@ -4295,6 +4988,7 @@ mod tests {
             .plain_indexes
             .contains_key("main/binary-amd64/Packages"));
         assert!(generated.plain_indexes.contains_key("main/source/Sources"));
+        assert!(generated.plain_indexes.contains_key("main/Contents-amd64"));
         assert!(generated
             .release_files
             .iter()
@@ -4303,6 +4997,24 @@ mod tests {
             .release_files
             .iter()
             .any(|(path, _)| path == "main/source/Sources.xz"));
+        assert!(generated
+            .release_files
+            .iter()
+            .any(|(path, _)| path == "main/Contents-amd64.gz"));
+        assert!(
+            generated
+                .release_files
+                .iter()
+                .any(|(path, _)| path.starts_with("by-hash/SHA256/")),
+            "synced metadata must publish by-hash aliases"
+        );
+        assert!(
+            generated
+                .plain_indexes
+                .values()
+                .any(|value| value.starts_with("@ref:")),
+            "by-hash aliases must be stored as @ref: logical-path pointers"
+        );
 
         let components = BTreeSet::from(["main".to_string()]);
         let architectures = BTreeSet::from(["amd64".to_string()]);
@@ -4321,9 +5033,49 @@ mod tests {
         assert!(release.contains(" main/binary-amd64/Packages\n"));
         assert!(release.contains(" main/binary-amd64/Packages.gz\n"));
         assert!(release.contains(" main/binary-amd64/Packages.xz\n"));
+        assert!(release.contains(" main/Contents-amd64\n"));
+        assert!(release.contains(" main/Contents-amd64.gz\n"));
         assert!(release.contains(" main/source/Sources\n"));
         assert!(release.contains(" main/source/Sources.gz\n"));
         assert!(release.contains(" main/source/Sources.xz\n"));
+        assert!(release.contains(" by-hash/SHA256/"));
+    }
+
+    #[test]
+    fn test_append_by_hash_release_files_adds_sha256_aliases() {
+        let mut files = vec![
+            ("main/binary-amd64/Packages".to_string(), b"hello".to_vec()),
+            ("main/Contents-amd64".to_string(), b"world".to_vec()),
+        ];
+        append_by_hash_release_files(&mut files);
+        let hello_sha = calculate_sha256_hex(b"hello");
+        let world_sha = calculate_sha256_hex(b"world");
+        assert!(files
+            .iter()
+            .any(|(path, bytes)| path == &by_hash_path("SHA256", &hello_sha) && bytes == b"hello"));
+        assert!(files
+            .iter()
+            .any(|(path, bytes)| path == &by_hash_path("SHA256", &world_sha) && bytes == b"world"));
+        // Idempotent: running again must not duplicate.
+        let before = files.len();
+        append_by_hash_release_files(&mut files);
+        assert_eq!(files.len(), before);
+    }
+
+    #[test]
+    fn test_parse_contents_request() {
+        let req = parse_contents_request("main/Contents-amd64").unwrap();
+        assert_eq!(req.component, "main");
+        assert_eq!(req.arch, "amd64");
+        assert!(matches!(req.ext, PackagesExt::Plain));
+
+        let req = parse_contents_request("universe/Contents-arm64.gz").unwrap();
+        assert_eq!(req.component, "universe");
+        assert_eq!(req.arch, "arm64");
+        assert!(matches!(req.ext, PackagesExt::Gz));
+
+        assert!(parse_contents_request("main/binary-amd64/Packages").is_none());
+        assert!(parse_contents_request("main/Contents-amd64.bz2").is_none());
     }
     #[test]
     fn test_package_matches_requested_arch() {
