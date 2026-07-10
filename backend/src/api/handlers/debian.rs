@@ -4225,6 +4225,11 @@ SHA256: deadbeef
             !body.contains("proxy_helpers::proxy_fetch_streaming(\n"),
             "prefetch must not use the un-verified streaming helper"
         );
+        assert!(
+            body.contains("parse_packages_index_blocking(")
+                && body.contains("parse_sources_index_blocking("),
+            "sync must parse Packages/Sources indexes via spawn_blocking helpers"
+        );
         // Prefetch paths are SSRF-validated before fetch.
         assert!(
             body.contains("validate_debian_fetch_path(&package.filename)")
