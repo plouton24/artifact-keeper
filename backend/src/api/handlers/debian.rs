@@ -42,7 +42,8 @@ use crate::api::{SharedState, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
 use crate::formats::debian::{
     build_contents_index, build_debian_sync_plan, by_hash_path, filter_release_package_indexes,
     filter_release_source_indexes, is_flat_repository_package_path, parse_packages_index,
-    parse_release, parse_sources_index, pool_path_allowed_by_filters, validate_debian_fetch_path,
+    parse_release, parse_sources_index, pool_path_allowed_by_filters,
+    release_path_allowed_by_filter, validate_debian_fetch_path,
     validate_release_filter_selection, DebControl, DebianHandler, DebianSyncDownloadPolicy,
     DebianSyncFilter, DebianSyncPlan, PackagesEntry, SourceFileEntry, SourcesEntry,
 };
@@ -3750,6 +3751,23 @@ async fn sync_remote_repository(
             &sources_by_index_path,
             download_policy,
         );
+
+        // Defense in depth: every selected index path must satisfy the same
+        // component/arch/source/Contents/i18n/DEP-11 filter used for pool downloads.
+        for index in plan
+            .package_indexes
+            .iter()
+            .map(|index| index.path.as_str())
+            .chain(plan.source_indexes.iter().map(|index| index.path.as_str()))
+        {
+            if !release_path_allowed_by_filter(index, &filter) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Sync plan selected index path outside configured filters: {index}"),
+                )
+                    .into_response());
+            }
+        }
 
         if config.generated_metadata_enabled() {
             let generated = build_synced_generated_metadata(
