@@ -3018,6 +3018,8 @@ async fn sync_remote_repository(
         components: config.effective_components(),
         architectures: config.effective_architectures(),
         include_source_packages: config.include_source_packages,
+        package_queries: Vec::new(),
+        resolve_dependencies: false,
     };
     let download_policy = if config.package_fetch_strategy
         == crate::api::handlers::repositories::DebianPackageFetchStrategy::PrefetchSelected

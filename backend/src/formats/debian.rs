@@ -8,7 +8,7 @@ use bytes::Bytes;
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Read;
 use tar::Archive;
 use xz2::read::XzDecoder;
@@ -600,6 +600,9 @@ pub struct DebianIndexPath {
     pub path: String,
 }
 
+/// Soft cap on decompressed Packages/Sources index text (gzip/xz/bz2/zstd/plain).
+pub const MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
 /// Distribution/component/architecture filters for Debian remote sync.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DebianSyncFilter {
@@ -607,6 +610,10 @@ pub struct DebianSyncFilter {
     pub components: Vec<String>,
     pub architectures: Vec<String>,
     pub include_source_packages: bool,
+    /// Optional package name queries (exact or trailing `*` glob). Empty = all packages.
+    pub package_queries: Vec<String>,
+    /// When package_queries is non-empty, also include Depends/Pre-Depends closure.
+    pub resolve_dependencies: bool,
 }
 
 /// Debian sync package download behavior.
@@ -729,21 +736,52 @@ pub fn parse_packages(content: &str) -> Result<Vec<PackagesEntry>> {
 }
 
 fn decode_debian_index_text(path: &str, content: &[u8], label: &str) -> Result<String> {
+    let reject_oversized = |len: usize| -> Result<()> {
+        if len as u64 > MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES {
+            return Err(AppError::Validation(format!(
+                "Decompressed {label} index exceeds maximum allowed size of {MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    };
+
     if path.ends_with(".gz") {
-        let mut decoder = GzDecoder::new(content);
+        let mut decoder = GzDecoder::new(content).take(MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES + 1);
         let mut text = String::new();
         decoder
             .read_to_string(&mut text)
             .map_err(|e| AppError::Validation(format!("Failed to decompress {label}.gz: {e}")))?;
+        reject_oversized(text.len())?;
         Ok(text)
     } else if path.ends_with(".xz") {
-        let mut decoder = XzDecoder::new(content);
+        let mut decoder = XzDecoder::new(content).take(MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES + 1);
         let mut text = String::new();
         decoder
             .read_to_string(&mut text)
             .map_err(|e| AppError::Validation(format!("Failed to decompress {label}.xz: {e}")))?;
+        reject_oversized(text.len())?;
+        Ok(text)
+    } else if path.ends_with(".bz2") {
+        let mut decoder = BzDecoder::new(content).take(MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES + 1);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::Validation(format!("Failed to decompress {label}.bz2: {e}")))?;
+        reject_oversized(text.len())?;
+        Ok(text)
+    } else if path.ends_with(".zst") || path.ends_with(".zstd") {
+        let decoder = ZstdDecoder::new(content).map_err(|e| {
+            AppError::Validation(format!("Failed to decompress {label}.zst: {e}"))
+        })?;
+        let mut decoder = decoder.take(MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES + 1);
+        let mut text = String::new();
+        decoder
+            .read_to_string(&mut text)
+            .map_err(|e| AppError::Validation(format!("Failed to decompress {label}.zst: {e}")))?;
+        reject_oversized(text.len())?;
         Ok(text)
     } else {
+        reject_oversized(content.len())?;
         String::from_utf8(content.to_vec())
             .map_err(|e| AppError::Validation(format!("{label} index is not UTF-8: {e}")))
     }
@@ -934,12 +972,250 @@ fn missing_release_filter_values(selected: &[String], advertised: &[String]) -> 
 }
 fn package_index_compression_rank(path: &str) -> u8 {
     if path.ends_with(".xz") {
+        4
+    } else if path.ends_with(".zst") || path.ends_with(".zstd") {
         3
     } else if path.ends_with(".gz") {
+        2
+    } else if path.ends_with(".bz2") {
         2
     } else {
         1
     }
+}
+
+/// Return true when `name` matches any package query (exact or trailing `*` prefix glob).
+/// Empty `queries` matches all names. Version constraints on `name` are stripped first.
+pub fn package_name_matches_queries(name: &str, queries: &[String]) -> bool {
+    if queries.is_empty() {
+        return true;
+    }
+    let name = parse_debian_dependency_package_name(name);
+    queries.iter().any(|query| {
+        let query = query.trim();
+        if query.is_empty() {
+            return false;
+        }
+        if let Some(prefix) = query.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            name == query
+        }
+    })
+}
+
+/// Extract the package name from a Debian dependency expression.
+/// Takes the first alternative before `|`, strips a parenthesized version constraint, and trims.
+pub fn parse_debian_dependency_package_name(dep: &str) -> &str {
+    let dep = dep.split('|').next().unwrap_or(dep).trim();
+    match dep.find('(') {
+        Some(idx) => dep[..idx].trim(),
+        None => dep,
+    }
+}
+
+/// Filter package index entries by name queries, optionally expanding Depends/Pre-Depends.
+pub fn filter_packages_by_query_with_dependencies(
+    entries: &[PackagesEntry],
+    queries: &[String],
+    resolve_deps: bool,
+) -> Vec<PackagesEntry> {
+    if queries.is_empty() {
+        return entries.to_vec();
+    }
+
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_provide: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        by_name
+            .entry(entry.control.package.as_str())
+            .or_default()
+            .push(idx);
+        if let Some(provides) = entry.control.provides.as_ref() {
+            for provide in provides {
+                let provide_name = parse_debian_dependency_package_name(provide);
+                if !provide_name.is_empty() {
+                    by_provide.entry(provide_name).or_default().push(idx);
+                }
+            }
+        }
+    }
+
+    let mut selected: HashSet<usize> = HashSet::new();
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if package_name_matches_queries(&entry.control.package, queries) {
+            if selected.insert(idx) {
+                queue.push_back(idx);
+            }
+        }
+    }
+
+    if resolve_deps {
+        while let Some(idx) = queue.pop_front() {
+            let entry = &entries[idx];
+            for dep_list in [entry.control.depends.as_ref(), entry.control.pre_depends.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                for dep in dep_list {
+                    let dep_name = parse_debian_dependency_package_name(dep);
+                    if dep_name.is_empty() {
+                        continue;
+                    }
+                    for &dep_idx in by_name
+                        .get(dep_name)
+                        .into_iter()
+                        .chain(by_provide.get(dep_name).into_iter())
+                        .flatten()
+                    {
+                        if selected.insert(dep_idx) {
+                            queue.push_back(dep_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| selected.contains(&idx).then(|| entry.clone()))
+        .collect()
+}
+
+/// Whether a Release-relative metadata path is allowed by component/arch/source filters.
+pub fn release_path_allowed_by_filter(path: &str, filter: &DebianSyncFilter) -> bool {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        return false;
+    }
+
+    let parts: Vec<&str> = path.split('/').collect();
+    let component_allowed = |component: &str| {
+        filter.components.is_empty() || filter.components.iter().any(|c| c == component)
+    };
+    let arch_allowed = |arch: &str| {
+        filter.architectures.is_empty() || filter.architectures.iter().any(|a| a == arch)
+    };
+    fn contents_arch(name: &str) -> Option<&str> {
+        let rest = name.strip_prefix("Contents-")?;
+        Some(rest.split('.').next().unwrap_or(rest))
+    }
+
+    if let Some(by_hash_idx) = parts.iter().position(|part| *part == "by-hash") {
+        if by_hash_idx == 0 {
+            return filter.components.is_empty();
+        }
+        return component_allowed(parts[0]);
+    }
+
+    if parts.len() >= 3 && parts[1].starts_with("binary-") && parts[2].starts_with("Packages") {
+        let arch = parts[1].trim_start_matches("binary-");
+        return component_allowed(parts[0]) && arch_allowed(arch);
+    }
+
+    if parts.len() >= 3 && parts[1] == "source" && parts[2].starts_with("Sources") {
+        return filter.include_source_packages && component_allowed(parts[0]);
+    }
+
+    if parts.len() >= 2 {
+        if let Some(arch) = contents_arch(parts[1]) {
+            return component_allowed(parts[0]) && arch_allowed(arch);
+        }
+    }
+
+    if parts.len() == 1 {
+        if let Some(arch) = contents_arch(parts[0]) {
+            return arch_allowed(arch);
+        }
+    }
+
+    if parts.len() >= 3 && parts[1] == "i18n" && parts[2].starts_with("Translation-") {
+        return component_allowed(parts[0]);
+    }
+
+    if parts.len() >= 3 && parts[1] == "dep11" {
+        return component_allowed(parts[0]);
+    }
+
+    false
+}
+
+/// Whether a pool package is allowed by component/arch/package-query filters.
+pub fn pool_path_allowed_by_filters(
+    component: &str,
+    filename: &str,
+    filter: &DebianSyncFilter,
+) -> bool {
+    if !filter.components.is_empty() && !filter.components.iter().any(|c| c == component) {
+        return false;
+    }
+
+    let Ok((package, _version, architecture)) = DebianHandler::parse_deb_filename(filename) else {
+        return false;
+    };
+
+    if architecture != "all"
+        && !filter.architectures.is_empty()
+        && !filter.architectures.iter().any(|arch| arch == &architecture)
+    {
+        return false;
+    }
+
+    if !filter.package_queries.is_empty()
+        && !package_name_matches_queries(&package, &filter.package_queries)
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Reject absolute http(s) URLs and path traversal in index-provided filenames.
+pub fn validate_debian_fetch_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(AppError::Validation(
+            "Debian fetch path must not be empty".to_string(),
+        ));
+    }
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Err(AppError::Validation(format!(
+            "Debian fetch path must be relative, not an absolute URL: {path}"
+        )));
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Err(AppError::Validation(format!(
+            "Debian fetch path must not contain '..' segments: {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// True for `.deb`/`.udeb` paths that are not under `pool/` (flat repository layout).
+pub fn is_flat_repository_package_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+    (path.ends_with(".deb") || path.ends_with(".udeb")) && !path.starts_with("pool/")
+}
+
+/// Build a Debian Contents index (`path\\tpackage` lines, sorted).
+pub fn build_contents_index(entries: &[(String, String)]) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|(path, package)| format!("{path}\t{package}"))
+        .collect();
+    lines.sort();
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Return a by-hash relative path: `by-hash/{algorithm}/{hash_hex}`.
+pub fn by_hash_path(algorithm: &str, hash_hex: &str) -> String {
+    format!("by-hash/{algorithm}/{hash_hex}")
 }
 
 /// Debian `Architecture: all` packages belong in every selected binary index.
@@ -974,6 +1250,18 @@ pub fn build_debian_sync_plan(
         let Some(entries) = packages_by_index_path.get(&index.path) else {
             missing_package_indexes.push(index.path.clone());
             continue;
+        };
+
+        let filtered_entries;
+        let entries = if filter.package_queries.is_empty() {
+            entries.as_slice()
+        } else {
+            filtered_entries = filter_packages_by_query_with_dependencies(
+                entries,
+                &filter.package_queries,
+                filter.resolve_dependencies,
+            );
+            filtered_entries.as_slice()
         };
 
         for entry in entries {
@@ -1434,7 +1722,7 @@ fn parse_release_package_index_path(path: &str) -> Option<DebianIndexPath> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() == 1 {
         let filename = parts[0];
-        if filename != "Packages" && filename != "Packages.gz" && filename != "Packages.xz" {
+        if !is_packages_index_filename(filename) {
             return None;
         }
         return Some(DebianIndexPath {
@@ -1448,7 +1736,7 @@ fn parse_release_package_index_path(path: &str) -> Option<DebianIndexPath> {
         return None;
     }
     let filename = parts[2];
-    if filename != "Packages" && filename != "Packages.gz" && filename != "Packages.xz" {
+    if !is_packages_index_filename(filename) {
         return None;
     }
 
@@ -1463,7 +1751,7 @@ fn parse_release_source_index_path(path: &str) -> Option<DebianSourceIndexPath> 
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() == 1 {
         let filename = parts[0];
-        if filename != "Sources" && filename != "Sources.gz" && filename != "Sources.xz" {
+        if !is_sources_index_filename(filename) {
             return None;
         }
         return Some(DebianSourceIndexPath {
@@ -1476,7 +1764,7 @@ fn parse_release_source_index_path(path: &str) -> Option<DebianSourceIndexPath> 
         return None;
     }
     let filename = parts[2];
-    if filename != "Sources" && filename != "Sources.gz" && filename != "Sources.xz" {
+    if !is_sources_index_filename(filename) {
         return None;
     }
 
@@ -1484,6 +1772,30 @@ fn parse_release_source_index_path(path: &str) -> Option<DebianSourceIndexPath> 
         component: parts[0].to_string(),
         path: path.to_string(),
     })
+}
+
+fn is_packages_index_filename(filename: &str) -> bool {
+    matches!(
+        filename,
+        "Packages"
+            | "Packages.gz"
+            | "Packages.xz"
+            | "Packages.bz2"
+            | "Packages.zst"
+            | "Packages.zstd"
+    )
+}
+
+fn is_sources_index_filename(filename: &str) -> bool {
+    matches!(
+        filename,
+        "Sources"
+            | "Sources.gz"
+            | "Sources.xz"
+            | "Sources.bz2"
+            | "Sources.zst"
+            | "Sources.zstd"
+    )
 }
 fn is_debian_metadata_path(path: &str) -> bool {
     matches!(
@@ -2425,6 +2737,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
 
         let indexes = filter_release_package_indexes(&release, &filter);
@@ -2454,6 +2768,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
 
         assert!(filter_release_package_indexes(&release, &filter).is_empty());
@@ -2463,6 +2779,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
         assert_eq!(filter_release_package_indexes(&release, &filter).len(), 1);
     }
@@ -2475,6 +2793,8 @@ Source: full-pkg-src
             components: vec!["universe".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
 
         let err = validate_release_filter_selection(&release, &filter).unwrap_err();
@@ -2491,6 +2811,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["arm64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
 
         let err = validate_release_filter_selection(&release, &filter).unwrap_err();
@@ -2506,6 +2828,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
 
         assert!(filter_release_source_indexes(&release, &filter).is_empty());
@@ -2528,6 +2852,8 @@ Source: full-pkg-src
             components: Vec::new(),
             architectures: vec!["amd64".to_string()],
             include_source_packages: true,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
 
         let package_indexes = filter_release_package_indexes(&release, &filter);
@@ -2622,6 +2948,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string(), "arm64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
         let mut packages_by_index_path = BTreeMap::new();
         packages_by_index_path.insert(
@@ -2692,6 +3020,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: true,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
         let packages_by_index_path = BTreeMap::new();
         let mut sources_by_index_path = BTreeMap::new();
@@ -2743,6 +3073,8 @@ Source: full-pkg-src
             components: vec!["main".to_string()],
             architectures: vec!["amd64".to_string()],
             include_source_packages: false,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
         };
         let packages_by_index_path = BTreeMap::new();
 
@@ -2831,5 +3163,346 @@ Source: full-pkg-src
     #[test]
     fn test_debian_handler_default() {
         let _handler = DebianHandler;
+    }
+
+    #[test]
+    fn test_decode_debian_index_rejects_oversized_plain_text() {
+        let oversized = vec![b'a'; (MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES as usize) + 1];
+        let err = decode_debian_index_text("Packages", &oversized, "Packages").unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum allowed size"));
+    }
+
+    #[test]
+    fn test_decode_debian_index_rejects_oversized_gzip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let oversized = vec![b'A'; (MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES as usize) + 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&oversized).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < (MAX_DEBIAN_INDEX_DECOMPRESSED_BYTES / 16) as usize);
+
+        let err = decode_debian_index_text("Packages.gz", &compressed, "Packages").unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum allowed size"));
+    }
+
+    #[test]
+    fn test_decode_debian_index_bz2_and_zst() {
+        use std::io::Write;
+
+        let plaintext = "Package: nginx\nVersion: 1.0\nArchitecture: amd64\n";
+
+        let mut bz2_encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bz2_encoder.write_all(plaintext.as_bytes()).unwrap();
+        let bz2_bytes = bz2_encoder.finish().unwrap();
+        let bz2_text = decode_debian_index_text("Packages.bz2", &bz2_bytes, "Packages").unwrap();
+        assert_eq!(bz2_text, plaintext);
+
+        let zst_bytes = zstd::stream::encode_all(plaintext.as_bytes(), 1).unwrap();
+        let zst_text = decode_debian_index_text("Packages.zst", &zst_bytes, "Packages").unwrap();
+        assert_eq!(zst_text, plaintext);
+
+        let zstd_text =
+            decode_debian_index_text("Packages.zstd", &zst_bytes, "Packages").unwrap();
+        assert_eq!(zstd_text, plaintext);
+    }
+
+    #[test]
+    fn test_package_name_matches_queries_exact_and_glob() {
+        assert!(package_name_matches_queries("nginx", &[]));
+        assert!(package_name_matches_queries(
+            "nginx",
+            &["nginx".to_string()]
+        ));
+        assert!(package_name_matches_queries(
+            "nginx",
+            &["ngi*".to_string()]
+        ));
+        assert!(!package_name_matches_queries(
+            "nginx",
+            &["apache*".to_string()]
+        ));
+        assert!(package_name_matches_queries(
+            "libc6 (>= 2.28)",
+            &["libc6".to_string()]
+        ));
+        assert_eq!(
+            parse_debian_dependency_package_name("vim | neovim (>= 0.5)"),
+            "vim"
+        );
+        assert_eq!(
+            parse_debian_dependency_package_name("libc6 (>= 2.28)"),
+            "libc6"
+        );
+    }
+
+    #[test]
+    fn test_filter_packages_by_query_with_dependency_resolution() {
+        let nginx = PackagesEntry {
+            control: DebControl {
+                package: "nginx".to_string(),
+                version: "1.0".to_string(),
+                architecture: "amd64".to_string(),
+                depends: Some(vec!["libc6 (>= 2.28)".to_string(), "virtual-ssl".to_string()]),
+                ..Default::default()
+            },
+            filename: Some("pool/main/n/nginx/nginx_1.0_amd64.deb".to_string()),
+            size: Some(10),
+            md5sum: None,
+            sha1: None,
+            sha256: None,
+        };
+        let libc6 = PackagesEntry {
+            control: DebControl {
+                package: "libc6".to_string(),
+                version: "2.36".to_string(),
+                architecture: "amd64".to_string(),
+                ..Default::default()
+            },
+            filename: Some("pool/main/g/glibc/libc6_2.36_amd64.deb".to_string()),
+            size: Some(10),
+            md5sum: None,
+            sha1: None,
+            sha256: None,
+        };
+        let libssl = PackagesEntry {
+            control: DebControl {
+                package: "libssl3".to_string(),
+                version: "3.0".to_string(),
+                architecture: "amd64".to_string(),
+                provides: Some(vec!["virtual-ssl".to_string()]),
+                ..Default::default()
+            },
+            filename: Some("pool/main/o/openssl/libssl3_3.0_amd64.deb".to_string()),
+            size: Some(10),
+            md5sum: None,
+            sha1: None,
+            sha256: None,
+        };
+        let unrelated = packages_entry(
+            "curl",
+            "1.0",
+            "amd64",
+            "pool/main/c/curl/curl_1.0_amd64.deb",
+        );
+        let entries = vec![nginx, libc6, libssl, unrelated];
+
+        let matched = filter_packages_by_query_with_dependencies(
+            &entries,
+            &["nginx".to_string()],
+            false,
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].control.package, "nginx");
+
+        let with_deps = filter_packages_by_query_with_dependencies(
+            &entries,
+            &["nginx".to_string()],
+            true,
+        );
+        let names: BTreeSet<_> = with_deps
+            .iter()
+            .map(|entry| entry.control.package.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["nginx", "libc6", "libssl3"])
+        );
+
+        let globbed = filter_packages_by_query_with_dependencies(
+            &entries,
+            &["lib*".to_string()],
+            false,
+        );
+        assert_eq!(globbed.len(), 2);
+    }
+
+    #[test]
+    fn test_build_debian_sync_plan_applies_package_queries_and_deps() {
+        let release = parse_release("Suite: jammy\nDate: Tue, 07 Jul 2026 12:00:00 UTC\nArchitectures: amd64\nComponents: main\nSHA256:\n a 1 main/binary-amd64/Packages.xz\n").unwrap();
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
+            package_queries: vec!["nginx".to_string()],
+            resolve_dependencies: true,
+        };
+        let mut packages_by_index_path = BTreeMap::new();
+        packages_by_index_path.insert(
+            "main/binary-amd64/Packages.xz".to_string(),
+            vec![
+                PackagesEntry {
+                    control: DebControl {
+                        package: "nginx".to_string(),
+                        version: "1.0".to_string(),
+                        architecture: "amd64".to_string(),
+                        depends: Some(vec!["libc6".to_string()]),
+                        ..Default::default()
+                    },
+                    filename: Some("pool/main/n/nginx/nginx_1.0_amd64.deb".to_string()),
+                    size: Some(10),
+                    md5sum: None,
+                    sha1: None,
+                    sha256: None,
+                },
+                packages_entry(
+                    "libc6",
+                    "2.36",
+                    "amd64",
+                    "pool/main/g/glibc/libc6_2.36_amd64.deb",
+                ),
+                packages_entry(
+                    "curl",
+                    "1.0",
+                    "amd64",
+                    "pool/main/c/curl/curl_1.0_amd64.deb",
+                ),
+            ],
+        );
+
+        let plan = build_debian_sync_plan(
+            "jammy",
+            &release,
+            &filter,
+            &packages_by_index_path,
+            &BTreeMap::new(),
+            DebianSyncDownloadPolicy::OnDemand,
+        );
+        let names: BTreeSet<_> = plan
+            .package_files
+            .iter()
+            .map(|file| file.package.as_str())
+            .collect();
+        assert_eq!(names, BTreeSet::from(["nginx", "libc6"]));
+    }
+
+    #[test]
+    fn test_release_path_allowed_by_filter() {
+        let filter = DebianSyncFilter {
+            distributions: vec!["jammy".to_string()],
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: true,
+            package_queries: Vec::new(),
+            resolve_dependencies: false,
+        };
+
+        assert!(release_path_allowed_by_filter(
+            "main/binary-amd64/Packages.xz",
+            &filter
+        ));
+        assert!(!release_path_allowed_by_filter(
+            "main/binary-arm64/Packages.xz",
+            &filter
+        ));
+        assert!(!release_path_allowed_by_filter(
+            "universe/binary-amd64/Packages.xz",
+            &filter
+        ));
+        assert!(release_path_allowed_by_filter(
+            "main/source/Sources.gz",
+            &filter
+        ));
+        assert!(release_path_allowed_by_filter(
+            "main/Contents-amd64.gz",
+            &filter
+        ));
+        assert!(release_path_allowed_by_filter("Contents-amd64", &filter));
+        assert!(release_path_allowed_by_filter(
+            "main/i18n/Translation-en.bz2",
+            &filter
+        ));
+        assert!(release_path_allowed_by_filter(
+            "main/dep11/Components-amd64.yml.gz",
+            &filter
+        ));
+        assert!(release_path_allowed_by_filter(
+            "main/by-hash/SHA256/abc",
+            &filter
+        ));
+        assert!(!release_path_allowed_by_filter(
+            "universe/by-hash/SHA256/abc",
+            &filter
+        ));
+
+        let no_source = DebianSyncFilter {
+            include_source_packages: false,
+            ..filter.clone()
+        };
+        assert!(!release_path_allowed_by_filter(
+            "main/source/Sources.xz",
+            &no_source
+        ));
+    }
+
+    #[test]
+    fn test_pool_path_allowed_by_filters() {
+        let filter = DebianSyncFilter {
+            distributions: Vec::new(),
+            components: vec!["main".to_string()],
+            architectures: vec!["amd64".to_string()],
+            include_source_packages: false,
+            package_queries: vec!["nginx*".to_string()],
+            resolve_dependencies: false,
+        };
+
+        assert!(pool_path_allowed_by_filters(
+            "main",
+            "nginx_1.0_amd64.deb",
+            &filter
+        ));
+        assert!(pool_path_allowed_by_filters(
+            "main",
+            "nginx-common_1.0_all.deb",
+            &filter
+        ));
+        assert!(!pool_path_allowed_by_filters(
+            "main",
+            "nginx_1.0_arm64.deb",
+            &filter
+        ));
+        assert!(!pool_path_allowed_by_filters(
+            "universe",
+            "nginx_1.0_amd64.deb",
+            &filter
+        ));
+        assert!(!pool_path_allowed_by_filters(
+            "main",
+            "curl_1.0_amd64.deb",
+            &filter
+        ));
+    }
+
+    #[test]
+    fn test_validate_debian_fetch_path_and_flat_package_path() {
+        assert!(validate_debian_fetch_path("pool/main/n/nginx/nginx_1.0_amd64.deb").is_ok());
+        assert!(validate_debian_fetch_path("nginx_1.0_amd64.deb").is_ok());
+        assert!(validate_debian_fetch_path("").is_err());
+        assert!(validate_debian_fetch_path("https://evil.example/pkg.deb").is_err());
+        assert!(validate_debian_fetch_path("http://evil.example/pkg.deb").is_err());
+        assert!(validate_debian_fetch_path("pool/../etc/passwd").is_err());
+
+        assert!(is_flat_repository_package_path("nginx_1.0_amd64.deb"));
+        assert!(is_flat_repository_package_path("pkgs/nginx_1.0_amd64.udeb"));
+        assert!(!is_flat_repository_package_path(
+            "pool/main/n/nginx/nginx_1.0_amd64.deb"
+        ));
+        assert!(!is_flat_repository_package_path("Release"));
+    }
+
+    #[test]
+    fn test_build_contents_index_and_by_hash_path() {
+        let index = build_contents_index(&[
+            ("usr/bin/nginx".to_string(), "nginx".to_string()),
+            ("bin/bash".to_string(), "bash".to_string()),
+        ]);
+        assert_eq!(index, "bin/bash\tbash\nusr/bin/nginx\tnginx\n");
+        assert_eq!(
+            by_hash_path("SHA256", "deadbeef"),
+            "by-hash/SHA256/deadbeef"
+        );
     }
 }
