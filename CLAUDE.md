@@ -297,4 +297,46 @@ Thank you to our backers for supporting ongoing development:
 - **Docker images** are published to `ghcr.io/artifact-keeper/artifact-keeper-{backend,web,openscap}` by the Docker Publish CI workflow on every push to main and on release tags.
 - **GitHub Pages site** (`/site/` directory): Combined landing page + Starlight docs, deployed to `artifactkeeper.com`.
 
+## Cursor Cloud specific instructions
+
+This repo is the **Rust backend** (Axum API on `:8080`, gRPC on `:9090`). The
+web UI is a separate repo (`artifact-keeper-web`). PostgreSQL 16 is the only
+hard dependency for running the backend; OpenSearch, Trivy, OpenSCAP,
+Dependency-Track, and Jaeger are optional (the backend degrades gracefully —
+search falls back to Postgres, scans are skipped — when they are unreachable).
+`AGENTS.md` is gitignored here, so these notes live in this file.
+
+### Toolchain / build
+
+- The workspace needs a Rust toolchain new enough for `edition2024` (stable
+  ≥ 1.85). If `rustc` is 1.83 the build fails with an `edition2024` error — run
+  `rustup default stable` first.
+- Build/test/clippy must run with `SQLX_OFFLINE=true`. Query metadata is
+  committed under `.sqlx/`, so no live database is needed to compile or run
+  unit tests (`cargo test --workspace --lib`). Without it, `sqlx` tries to
+  connect at compile time and fails.
+- `cargo clippy --workspace --all-targets -- -D warnings` (the CI lint gate)
+  currently reports a few pre-existing `redundant reference` /
+  `useless_borrows_in_formatting` findings in **test** code in
+  `backend/src/api/handlers/repositories.rs` under the newest stable clippy.
+  These are pre-existing, not an env issue; library/binary clippy
+  (`cargo clippy --workspace -- -D warnings`) is clean.
+
+### Running the backend natively
+
+- The backend auto-runs embedded SQLx migrations on startup and provisions an
+  `admin` user from `ADMIN_PASSWORD` on first boot. It starts in a
+  `SETUP_REQUIRED` state that gates mutations until the admin password is
+  changed (via the UI or `POST /api/v1/users/<id>/password`).
+- Do **not** source `.env.local-dev` verbatim: its `AK_WEBHOOK_SECRET_KEY` is
+  an intentionally invalid base64 placeholder, and the backend calls
+  `std::process::exit(1)` at boot when the key is set-but-invalid. Either leave
+  `AK_WEBHOOK_SECRET_KEY` unset (only webhook create/rotate then 500) or set a
+  real key: `openssl rand -base64 32`.
+- `.env.local-dev` also points `DATABASE_URL` at port `30432` (the Compose
+  Postgres). A native Postgres install listens on `5432`, so use
+  `DATABASE_URL=postgresql://registry:registry@127.0.0.1:5432/artifact_registry`.
+  Then `cargo run -p artifact-keeper-backend`. Docker (`scripts/dev.sh` /
+  `docker-compose.local-dev.yml`) is the documented path but not required.
+
 <!-- MANUAL ADDITIONS END -->
